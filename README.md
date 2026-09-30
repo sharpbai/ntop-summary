@@ -145,7 +145,35 @@ current flow bytes - previous flow bytes = bytes added this minute
 
 Deltas are aggregated into one-minute SQLite buckets, which can later be queried over arbitrary time ranges.
 
+## Performance and daily rollups
+
+Long historical queries do not scan all minute-level rows.
+
+The collector maintains a `traffic_daily` rollup table for completed calendar days. Historical queries combine:
+
+- `traffic_daily` for complete days
+- `traffic` for the current/partial day
+
+This keeps `today` precise while making `month`, `7d`, and `30d` much faster as the database grows.
+
+When upgrading an existing installation, install the new scripts and build the rollup table once:
+
+```bash
+sudo ntop-collector --rollup
+```
+
+Check the result:
+
+```bash
+ntop-collector --status
+```
+
+You should see both `Minute rows` and `Daily rows`. Normal once-per-minute collector runs automatically roll up newly completed days.
+
+SQLite uses WAL mode, in-memory temporary storage, and a 64 MiB page cache for these queries.
+
 ## Database
+
 
 The `traffic` table stores:
 
@@ -157,6 +185,8 @@ The `traffic` table stores:
 - l7
 - bytes
 - new_flows
+
+The `traffic_daily` table has the same traffic dimensions but stores one row per completed calendar day and aggregation key. It is used to accelerate long-range reports.
 
 The `flow_state` table stores the last observed counter for active flows. Stale state is removed after two days.
 
