@@ -35,6 +35,47 @@ Developed against ntopng 7.0 Community using:
 /lua/rest/v2/get/flow/active.lua
 ```
 
+## Quick install / upgrade
+
+The installer works for both new installations and upgrades:
+
+```bash
+git clone https://github.com/sharpbai/ntop-summary.git
+cd ntop-summary
+sudo ./install.sh
+```
+
+For an existing clone:
+
+```bash
+git pull
+sudo ./install.sh
+```
+
+The installer:
+
+- installs `ntop-summary` and `ntop-collector` into `/usr/local/bin`
+- preserves an existing `/etc/ntop-tools.conf`
+- creates the configuration from the example on a new installation
+- detects databases created by the earlier manual/non-repository deployment
+- validates that a candidate SQLite database has the expected `traffic` schema
+- preserves a database already located at the configured `NTOP_DB` path
+- safely imports a legacy database from another location using SQLite's backup API
+- backs up an existing destination database before replacing it
+- creates/upgrades the daily-rollup schema
+- builds historical daily rollups automatically
+- installs and enables the systemd collector timer
+
+The original manual deployment path `/var/lib/ntop-tools/traffic.db` is detected automatically. The installer also checks several common locations and performs a bounded search under `/var/lib`, `/root`, and `/home` when necessary.
+
+After installation, verify:
+
+```bash
+ntop-collector --status
+systemctl status ntop-collector.timer --no-pager
+time ntop-summary 30d
+```
+
 ## Install
 
 ```bash
