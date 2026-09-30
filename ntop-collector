@@ -1,41 +1,28 @@
 #!/usr/bin/env python3
-import base64
-import json
-import os
-import sqlite3
-import ssl
-import sys
-import time
-import urllib.request
+import base64, json, os, sqlite3, ssl, sys, time, urllib.request
+from datetime import datetime
 from pathlib import Path
 
-CONFIG = "/etc/ntop-tools.conf"
+CONFIG="/etc/ntop-tools.conf"
 
 def load_config():
-    cfg = {}
+    cfg={}
     if os.path.exists(CONFIG):
-        with open(CONFIG, encoding="utf-8") as f:
+        with open(CONFIG,encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                cfg[key.strip()] = value.strip()
-    for key, value in os.environ.items():
-        if key.startswith("NTOP_"):
-            cfg[key] = value
+                line=line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k,v=line.split("=",1); cfg[k.strip()]=v.strip()
+    for k,v in os.environ.items():
+        if k.startswith("NTOP_"): cfg[k]=v
     return cfg
 
-CFG = load_config()
-HOST = CFG.get("NTOP_HOST", "127.0.0.1")
-PORT = CFG.get("NTOP_PORT", "3001")
-USER = CFG.get("NTOP_USER", "admin")
-PASSWORD = CFG.get("NTOP_PASS", "")
-IFID = CFG.get("NTOP_IFID", "1")
-PER_PAGE = int(CFG.get("NTOP_PER_PAGE", "5000"))
-DB = CFG.get("NTOP_DB", "/var/lib/ntop-tools/traffic.db")
-BASE = f"https://{HOST}:{PORT}"
-CTX = ssl._create_unverified_context()
+CFG=load_config()
+HOST=CFG.get("NTOP_HOST","127.0.0.1"); PORT=CFG.get("NTOP_PORT","3001")
+USER=CFG.get("NTOP_USER","admin"); PASSWORD=CFG.get("NTOP_PASS","")
+IFID=CFG.get("NTOP_IFID","1"); PER_PAGE=int(CFG.get("NTOP_PER_PAGE","5000"))
+DB=CFG.get("NTOP_DB","/var/lib/ntop-tools/traffic.db")
+BASE=f"https://{HOST}:{PORT}"; CTX=ssl._create_unverified_context()
 
 def usage():
     print("""ntop-collector - ntopng flow delta collector
@@ -43,174 +30,161 @@ def usage():
 Usage:
   ntop-collector
   ntop-collector --status
+  ntop-collector --rollup
   ntop-collector --help
 
-Reads active flows from ntopng, calculates byte deltas, and stores
-per-minute aggregates in SQLite. Recommended interval: one minute.
-
-Configuration: /etc/ntop-tools.conf
-Default DB:    /var/lib/ntop-tools/traffic.db""")
+Each normal run stores one-minute deltas and refreshes daily rollups for
+completed days. --rollup rebuilds all daily summaries from existing minute
+data and is safe to run after upgrading an existing database.""")
 
 def api(path):
-    if not PASSWORD:
-        raise RuntimeError("NTOP_PASS is not configured")
-    req = urllib.request.Request(BASE + path)
-    token = base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
-    req.add_header("Authorization", f"Basic {token}")
-    with urllib.request.urlopen(req, context=CTX, timeout=30) as response:
+    if not PASSWORD: raise RuntimeError("NTOP_PASS is not configured")
+    req=urllib.request.Request(BASE+path)
+    token=base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
+    req.add_header("Authorization",f"Basic {token}")
+    with urllib.request.urlopen(req,context=CTX,timeout=30) as response:
         return json.load(response)
 
 def db_connect():
-    Path(DB).parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB, timeout=30)
+    Path(DB).parent.mkdir(parents=True,exist_ok=True)
+    con=sqlite3.connect(DB,timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA cache_size=-65536")
     con.executescript("""
     CREATE TABLE IF NOT EXISTS flow_state (
-        flow_id TEXT PRIMARY KEY,
-        last_bytes INTEGER NOT NULL,
-        first_seen INTEGER,
-        last_seen INTEGER,
-        sampled_at INTEGER NOT NULL
+      flow_id TEXT PRIMARY KEY,last_bytes INTEGER NOT NULL,first_seen INTEGER,
+      last_seen INTEGER,sampled_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS traffic (
-        bucket INTEGER NOT NULL,
-        src_ip TEXT NOT NULL,
-        dst_ip TEXT NOT NULL,
-        dst_port INTEGER NOT NULL,
-        l4 TEXT NOT NULL DEFAULT '',
-        l7 TEXT NOT NULL DEFAULT '',
-        bytes INTEGER NOT NULL DEFAULT 0,
-        new_flows INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (bucket, src_ip, dst_ip, dst_port, l4, l7)
+      bucket INTEGER NOT NULL,src_ip TEXT NOT NULL,dst_ip TEXT NOT NULL,
+      dst_port INTEGER NOT NULL,l4 TEXT NOT NULL DEFAULT '',l7 TEXT NOT NULL DEFAULT '',
+      bytes INTEGER NOT NULL DEFAULT 0,new_flows INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(bucket,src_ip,dst_ip,dst_port,l4,l7)
     );
+    CREATE TABLE IF NOT EXISTS traffic_daily (
+      day INTEGER NOT NULL,src_ip TEXT NOT NULL,dst_ip TEXT NOT NULL,
+      dst_port INTEGER NOT NULL,l4 TEXT NOT NULL DEFAULT '',l7 TEXT NOT NULL DEFAULT '',
+      bytes INTEGER NOT NULL DEFAULT 0,new_flows INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(day,src_ip,dst_ip,dst_port,l4,l7)
+    );
+    CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic(bucket);
     CREATE INDEX IF NOT EXISTS idx_traffic_src ON traffic(src_ip);
     CREATE INDEX IF NOT EXISTS idx_traffic_port ON traffic(dst_port);
+    CREATE INDEX IF NOT EXISTS idx_daily_day_src_port ON traffic_daily(day,src_ip,dst_port);
+    CREATE INDEX IF NOT EXISTS idx_daily_day_port ON traffic_daily(day,dst_port);
     """)
     return con
 
+def local_day_start(ts):
+    d=datetime.fromtimestamp(ts)
+    return int(d.replace(hour=0,minute=0,second=0,microsecond=0).timestamp())
+
+def rebuild_day(con,day):
+    end=day+86400
+    con.execute("DELETE FROM traffic_daily WHERE day=?",(day,))
+    con.execute("""
+      INSERT INTO traffic_daily(day,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows)
+      SELECT ?,src_ip,dst_ip,dst_port,l4,l7,SUM(bytes),SUM(new_flows)
+      FROM traffic WHERE bucket>=? AND bucket<?
+      GROUP BY src_ip,dst_ip,dst_port,l4,l7
+    """,(day,day,end))
+
+def rollup_all(con):
+    days=[r[0] for r in con.execute(
+      "SELECT DISTINCT (bucket - ((bucket - ?) % 86400)) FROM traffic ORDER BY 1",
+      (int(time.mktime((1970,1,1,0,0,0,0,1,-1))),)
+    )]
+    # Recompute day boundaries with local time to avoid relying on UTC modulo.
+    first,last=con.execute("SELECT MIN(bucket),MAX(bucket) FROM traffic").fetchone()
+    if first is None: return 0
+    day=local_day_start(first); last_day=local_day_start(last); n=0
+    while day<=last_day:
+        rebuild_day(con,day); n+=1
+        next_dt=datetime.fromtimestamp(day).replace(hour=0,minute=0,second=0,microsecond=0)
+        day=int((next_dt.fromordinal(next_dt.toordinal()+1)).timestamp())
+    con.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('daily_rollup_ready','1')")
+    return n
+
+def refresh_completed_days(con,now):
+    today=local_day_start(now)
+    last=con.execute("SELECT value FROM metadata WHERE key='last_completed_rollup'").fetchone()
+    if last is None:
+        first=con.execute("SELECT MIN(bucket) FROM traffic WHERE bucket<?",(today,)).fetchone()[0]
+        day=local_day_start(first) if first is not None else today
+    else:
+        day=int(last[0])+86400
+    count=0
+    while day<today:
+        rebuild_day(con,day)
+        con.execute("INSERT OR REPLACE INTO metadata(key,value) VALUES('last_completed_rollup',?)",(str(day),))
+        day+=86400; count+=1
+    return count
+
 def get_flows():
-    page = 1
-    result = []
+    page=1; result=[]
     while True:
-        path = ("/lua/rest/v2/get/flow/active.lua"
-                f"?ifid={IFID}&perPage={PER_PAGE}&currentPage={page}")
-        rsp = api(path).get("rsp", {})
-        rows = rsp.get("data", [])
-        result.extend(rows)
-        total = int(rsp.get("totalRows", len(result)))
-        if not rows or len(result) >= total:
-            break
-        page += 1
-        if page > 1000:
-            raise RuntimeError("Too many API pages")
-    return result
+        rsp=api("/lua/rest/v2/get/flow/active.lua"+f"?ifid={IFID}&perPage={PER_PAGE}&currentPage={page}").get("rsp",{})
+        rows=rsp.get("data",[]); result.extend(rows)
+        if not rows or len(result)>=int(rsp.get("totalRows",len(result))): return result
+        page+=1
+        if page>1000: raise RuntimeError("Too many API pages")
 
 def flow_id(row):
-    return "{}:{}:{}".format(
-        row.get("key", ""), row.get("hash_id", ""), row.get("first_seen", "")
-    )
+    return "{}:{}:{}".format(row.get("key",""),row.get("hash_id",""),row.get("first_seen",""))
 
 def collect():
-    now = int(time.time())
-    bucket = now - now % 60
-    flows = get_flows()
-    con = db_connect()
-    total_delta = 0
-    new_flows = 0
-
+    now=int(time.time()); bucket=now-now%60; flows=get_flows(); con=db_connect()
+    total_delta=0; new_flows=0
     with con:
         for row in flows:
-            client = row.get("client", {})
-            server = row.get("server", {})
-            proto = row.get("protocol", {})
-            src_ip = str(client.get("ip", "") or "")
-            dst_ip = str(server.get("ip", "") or "")
-            dst_port = int(server.get("port", 0) or 0)
-            l4 = str(proto.get("l4", "") or "")
-            l7 = str(proto.get("l7", "") or "")
-            current = int(row.get("bytes", 0) or 0)
-            first_seen = int(row.get("first_seen", 0) or 0)
-            last_seen = int(row.get("last_seen", 0) or 0)
-            fid = flow_id(row)
-
-            old = con.execute(
-                "SELECT last_bytes FROM flow_state WHERE flow_id=?", (fid,)
-            ).fetchone()
-
-            is_new = 0
-            if old is None:
-                delta = current
-                is_new = 1
-                new_flows += 1
+            c=row.get("client",{}); s=row.get("server",{}); p=row.get("protocol",{})
+            src=str(c.get("ip","") or ""); dst=str(s.get("ip","") or "")
+            port=int(s.get("port",0) or 0); l4=str(p.get("l4","") or ""); l7=str(p.get("l7","") or "")
+            current=int(row.get("bytes",0) or 0); first=int(row.get("first_seen",0) or 0)
+            last=int(row.get("last_seen",0) or 0); fid=flow_id(row)
+            old=con.execute("SELECT last_bytes FROM flow_state WHERE flow_id=?",(fid,)).fetchone()
+            is_new=0
+            if old is None: delta=current; is_new=1; new_flows+=1
             else:
-                previous = int(old[0])
-                delta = current - previous if current >= previous else current
-
-            con.execute("""
-                INSERT INTO flow_state
-                    (flow_id,last_bytes,first_seen,last_seen,sampled_at)
-                VALUES (?,?,?,?,?)
-                ON CONFLICT(flow_id) DO UPDATE SET
-                    last_bytes=excluded.last_bytes,
-                    first_seen=excluded.first_seen,
-                    last_seen=excluded.last_seen,
-                    sampled_at=excluded.sampled_at
-            """, (fid, current, first_seen, last_seen, now))
-
-            if delta <= 0:
-                continue
-
-            total_delta += delta
-            con.execute("""
-                INSERT INTO traffic
-                    (bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows)
-                VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(bucket,src_ip,dst_ip,dst_port,l4,l7)
-                DO UPDATE SET
-                    bytes=bytes+excluded.bytes,
-                    new_flows=new_flows+excluded.new_flows
-            """, (bucket, src_ip, dst_ip, dst_port, l4, l7, delta, is_new))
-
-        con.execute(
-            "DELETE FROM flow_state WHERE sampled_at < ?", (now - 172800,)
-        )
-
+                previous=int(old[0]); delta=current-previous if current>=previous else current
+            con.execute("""INSERT INTO flow_state(flow_id,last_bytes,first_seen,last_seen,sampled_at)
+              VALUES(?,?,?,?,?) ON CONFLICT(flow_id) DO UPDATE SET
+              last_bytes=excluded.last_bytes,first_seen=excluded.first_seen,
+              last_seen=excluded.last_seen,sampled_at=excluded.sampled_at""",
+              (fid,current,first,last,now))
+            if delta>0:
+                total_delta+=delta
+                con.execute("""INSERT INTO traffic(bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows)
+                  VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(bucket,src_ip,dst_ip,dst_port,l4,l7)
+                  DO UPDATE SET bytes=bytes+excluded.bytes,new_flows=new_flows+excluded.new_flows""",
+                  (bucket,src,dst,port,l4,l7,delta,is_new))
+        con.execute("DELETE FROM flow_state WHERE sampled_at<?",(now-172800,))
+        rolled=refresh_completed_days(con,now)
     con.close()
-    print(
-        f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"active_flows={len(flows)} new_flows={new_flows} "
-        f"delta_bytes={total_delta}"
-    )
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} active_flows={len(flows)} new_flows={new_flows} delta_bytes={total_delta} rolled_days={rolled}")
 
 def status():
-    con = db_connect()
-    count, total, first, last = con.execute("""
-        SELECT COUNT(*),COALESCE(SUM(bytes),0),MIN(bucket),MAX(bucket)
-        FROM traffic
-    """).fetchone()
-    states = con.execute("SELECT COUNT(*) FROM flow_state").fetchone()[0]
-    con.close()
-    print(f"Database     : {DB}")
-    print(f"Rows         : {count:,}")
-    print(f"Flow states  : {states:,}")
-    print(f"Stored bytes : {total:,}")
-    if first:
-        print("First sample :", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(first)))
-    if last:
-        print("Last sample  :", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last)))
+    con=db_connect()
+    rows,b,first,last=con.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0),MIN(bucket),MAX(bucket) FROM traffic").fetchone()
+    daily=con.execute("SELECT COUNT(*) FROM traffic_daily").fetchone()[0]
+    states=con.execute("SELECT COUNT(*) FROM flow_state").fetchone()[0]; con.close()
+    print(f"Database     : {DB}\nMinute rows  : {rows:,}\nDaily rows   : {daily:,}\nFlow states  : {states:,}\nStored bytes : {b:,}")
+    if first: print("First sample :",time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(first)))
+    if last: print("Last sample  :",time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(last)))
 
-if __name__ == "__main__":
+def manual_rollup():
+    con=db_connect()
+    with con: n=rollup_all(con)
+    con.close(); print(f"Rebuilt daily rollups for {n} day(s)")
+
+if __name__=="__main__":
     try:
-        if "-h" in sys.argv or "--help" in sys.argv:
-            usage()
-        elif "--status" in sys.argv:
-            status()
-        else:
-            collect()
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        sys.exit(1)
+        if "-h" in sys.argv or "--help" in sys.argv: usage()
+        elif "--status" in sys.argv: status()
+        elif "--rollup" in sys.argv: manual_rollup()
+        else: collect()
+    except KeyboardInterrupt: sys.exit(130)
+    except Exception as exc: print(f"ERROR: {exc}",file=sys.stderr); sys.exit(1)
