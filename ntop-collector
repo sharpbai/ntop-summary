@@ -69,12 +69,36 @@ def db_connect():
       bytes INTEGER NOT NULL DEFAULT 0,new_flows INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(day,src_ip,dst_ip,dst_port,l4,l7)
     );
+    CREATE TABLE IF NOT EXISTS traffic_daily_ip_port (
+      day INTEGER NOT NULL,src_ip TEXT NOT NULL,dst_port INTEGER NOT NULL,
+      bytes INTEGER NOT NULL DEFAULT 0,new_flows INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(day,src_ip,dst_port)
+    );
+    CREATE TABLE IF NOT EXISTS traffic_daily_ip (
+      day INTEGER NOT NULL,src_ip TEXT NOT NULL,
+      bytes INTEGER NOT NULL DEFAULT 0,new_flows INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(day,src_ip)
+    );
+    CREATE TABLE IF NOT EXISTS traffic_daily_port (
+      day INTEGER NOT NULL,dst_port INTEGER NOT NULL,
+      bytes INTEGER NOT NULL DEFAULT 0,new_flows INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(day,dst_port)
+    );
+    CREATE TABLE IF NOT EXISTS traffic_daily_dst (
+      day INTEGER NOT NULL,dst_ip TEXT NOT NULL,dst_port INTEGER NOT NULL,
+      bytes INTEGER NOT NULL DEFAULT 0,new_flows INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(day,dst_ip,dst_port)
+    );
     CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic(bucket);
     CREATE INDEX IF NOT EXISTS idx_traffic_src ON traffic(src_ip);
     CREATE INDEX IF NOT EXISTS idx_traffic_port ON traffic(dst_port);
     CREATE INDEX IF NOT EXISTS idx_daily_day_src_port ON traffic_daily(day,src_ip,dst_port);
     CREATE INDEX IF NOT EXISTS idx_daily_day_port ON traffic_daily(day,dst_port);
+    CREATE INDEX IF NOT EXISTS idx_daily_ip_port_day ON traffic_daily_ip_port(day);
+    CREATE INDEX IF NOT EXISTS idx_daily_ip_day ON traffic_daily_ip(day);
+    CREATE INDEX IF NOT EXISTS idx_daily_port_day ON traffic_daily_port(day);
+    CREATE INDEX IF NOT EXISTS idx_daily_dst_day ON traffic_daily_dst(day);
     """)
     return con
 
@@ -84,12 +108,47 @@ def local_day_start(ts):
 
 def rebuild_day(con,day):
     end=day+86400
+
+    # Detailed daily rollup: retained for L7 and uncommon mixed filters.
     con.execute("DELETE FROM traffic_daily WHERE day=?",(day,))
     con.execute("""
       INSERT INTO traffic_daily(day,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows)
       SELECT ?,src_ip,dst_ip,dst_port,l4,l7,SUM(bytes),SUM(new_flows)
       FROM traffic WHERE bucket>=? AND bucket<?
       GROUP BY src_ip,dst_ip,dst_port,l4,l7
+    """,(day,day,end))
+
+    # Compact rollups matching the common ntop-summary GROUP BY modes.
+    con.execute("DELETE FROM traffic_daily_ip_port WHERE day=?",(day,))
+    con.execute("""
+      INSERT INTO traffic_daily_ip_port(day,src_ip,dst_port,bytes,new_flows)
+      SELECT ?,src_ip,dst_port,SUM(bytes),SUM(new_flows)
+      FROM traffic WHERE bucket>=? AND bucket<?
+      GROUP BY src_ip,dst_port
+    """,(day,day,end))
+
+    con.execute("DELETE FROM traffic_daily_ip WHERE day=?",(day,))
+    con.execute("""
+      INSERT INTO traffic_daily_ip(day,src_ip,bytes,new_flows)
+      SELECT ?,src_ip,SUM(bytes),SUM(new_flows)
+      FROM traffic WHERE bucket>=? AND bucket<?
+      GROUP BY src_ip
+    """,(day,day,end))
+
+    con.execute("DELETE FROM traffic_daily_port WHERE day=?",(day,))
+    con.execute("""
+      INSERT INTO traffic_daily_port(day,dst_port,bytes,new_flows)
+      SELECT ?,dst_port,SUM(bytes),SUM(new_flows)
+      FROM traffic WHERE bucket>=? AND bucket<?
+      GROUP BY dst_port
+    """,(day,day,end))
+
+    con.execute("DELETE FROM traffic_daily_dst WHERE day=?",(day,))
+    con.execute("""
+      INSERT INTO traffic_daily_dst(day,dst_ip,dst_port,bytes,new_flows)
+      SELECT ?,dst_ip,dst_port,SUM(bytes),SUM(new_flows)
+      FROM traffic WHERE bucket>=? AND bucket<?
+      GROUP BY dst_ip,dst_port
     """,(day,day,end))
 
 def rollup_all(con):
@@ -170,8 +229,9 @@ def status():
     con=db_connect()
     rows,b,first,last=con.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0),MIN(bucket),MAX(bucket) FROM traffic").fetchone()
     daily=con.execute("SELECT COUNT(*) FROM traffic_daily").fetchone()[0]
+    daily_ip_port=con.execute("SELECT COUNT(*) FROM traffic_daily_ip_port").fetchone()[0]
     states=con.execute("SELECT COUNT(*) FROM flow_state").fetchone()[0]; con.close()
-    print(f"Database     : {DB}\nMinute rows  : {rows:,}\nDaily rows   : {daily:,}\nFlow states  : {states:,}\nStored bytes : {b:,}")
+    print(f"Database     : {DB}\nMinute rows  : {rows:,}\nDaily rows   : {daily:,}\nIP/port rows : {daily_ip_port:,}\nFlow states  : {states:,}\nStored bytes : {b:,}")
     if first: print("First sample :",time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(first)))
     if last: print("Last sample  :",time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(last)))
 
