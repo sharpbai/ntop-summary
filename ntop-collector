@@ -30,6 +30,7 @@ def usage():
 Usage:
   ntop-collector
   ntop-collector --status
+  ntop-collector --status-full
   ntop-collector --rollup
   ntop-collector --help
 
@@ -249,13 +250,48 @@ def collect():
     con.close()
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} active_flows={len(flows)} new_flows={new_flows} delta_bytes={total_delta} rolled_days={rolled}")
 
-def status():
+def status(full=False):
     con=db_connect()
-    rows,b,first,last=con.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0),MIN(bucket),MAX(bucket) FROM traffic").fetchone()
-    daily=con.execute("SELECT COUNT(*) FROM traffic_daily").fetchone()[0]
+    first_row=con.execute("SELECT bucket FROM traffic ORDER BY bucket ASC LIMIT 1").fetchone()
+    last_row=con.execute("SELECT bucket FROM traffic ORDER BY bucket DESC LIMIT 1").fetchone()
+    first=first_row[0] if first_row else None
+    last=last_row[0] if last_row else None
+    states=con.execute("SELECT COUNT(*) FROM flow_state").fetchone()[0]
     daily_ip_port=con.execute("SELECT COUNT(*) FROM traffic_daily_ip_port").fetchone()[0]
-    states=con.execute("SELECT COUNT(*) FROM flow_state").fetchone()[0]; con.close()
-    print(f"Database     : {DB}\nMinute rows  : {rows:,}\nDaily rows   : {daily:,}\nIP/port rows : {daily_ip_port:,}\nFlow states  : {states:,}\nStored bytes : {b:,}")
+
+    if full:
+        rows,b=con.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM traffic").fetchone()
+        minute_rows=f"{rows:,}"
+        stored_bytes=f"{b:,}"
+    else:
+        minute_rows="not counted (fast status)"
+        ready=con.execute("SELECT value FROM metadata WHERE key='daily_rollup_ready'").fetchone()
+        if ready:
+            today=local_day_start(int(time.time()))
+            archived=con.execute(
+                "SELECT COALESCE(SUM(bytes),0) FROM traffic_daily_port WHERE day<?",
+                (today,)
+            ).fetchone()[0]
+            current=con.execute(
+                "SELECT COALESCE(SUM(bytes),0) FROM traffic WHERE bucket>=?",
+                (today,)
+            ).fetchone()[0]
+            stored_bytes=f"{archived+current:,}"
+        else:
+            stored_bytes="not calculated (run --rollup)"
+
+    try:
+        db_size=os.path.getsize(DB)
+    except OSError:
+        db_size=0
+    con.close()
+
+    print(f"Database     : {DB}")
+    print(f"DB size      : {db_size:,} bytes")
+    print(f"Minute rows  : {minute_rows}")
+    print(f"IP/port rows : {daily_ip_port:,}")
+    print(f"Flow states  : {states:,}")
+    print(f"Stored bytes : {stored_bytes}")
     if first: print("First sample :",time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(first)))
     if last: print("Last sample  :",time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(last)))
 
@@ -267,7 +303,8 @@ def manual_rollup():
 if __name__=="__main__":
     try:
         if "-h" in sys.argv or "--help" in sys.argv: usage()
-        elif "--status" in sys.argv: status()
+        elif "--status-full" in sys.argv: status(full=True)
+        elif "--status" in sys.argv: status(full=False)
         elif "--rollup" in sys.argv: manual_rollup()
         else: collect()
     except KeyboardInterrupt: sys.exit(130)
