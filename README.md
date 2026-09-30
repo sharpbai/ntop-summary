@@ -52,7 +52,24 @@ git pull
 sudo ./install.sh
 ```
 
+The installer first checks whether `ntopng` is installed. If it is missing, it detects the operating system and installs the ntop official stable repository/package automatically on supported Debian/Ubuntu releases.
+
+On multi-interface hosts the installer deliberately does **not** guess which NIC should be monitored. If ntopng has no capture interface configured yet, set it after installation, for example:
+
+```ini
+# /etc/ntopng/ntopng.conf
+-i=eth1
+```
+
+Then start/restart ntopng:
+
+```bash
+sudo systemctl enable --now ntopng
+sudo systemctl restart ntopng
+```
+
 The installer:
+
 
 - installs `ntop-summary` and `ntop-collector` into `/usr/local/bin`
 - preserves an existing `/etc/ntop-tools.conf`
