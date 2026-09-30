@@ -1,0 +1,10 @@
+[Unit]
+Description=Run ntopng Traffic Collector Every Minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=true
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
