@@ -241,6 +241,14 @@ Check the result:
 ntop-collector --status
 ```
 
+`--status` is intentionally lightweight and avoids scanning the full minute-level table. For an exact full-table row count and byte sum, use:
+
+```bash
+ntop-collector --status-full
+```
+
+On a large historical database, `--status-full` can take noticeably longer.
+
 You should see both `Minute rows` and `Daily rows`. Normal once-per-minute collector runs automatically roll up newly completed days.
 
 SQLite uses WAL mode, in-memory temporary storage, and a 64 MiB page cache for these queries.
