@@ -30,7 +30,7 @@ install_ntopng() {
     ubuntu)
       case "${VERSION_ID:-}" in
         22.04|24.04)
-          repo_version="$VERSION_ID"
+          repo_url="https://packages.ntop.org/apt-stable/$VERSION_ID/all/apt-ntop-stable.deb"
           ;;
         *)
           die "Unsupported Ubuntu version: ${VERSION_ID:-unknown}. Install ntopng manually, then rerun this installer."
@@ -39,8 +39,14 @@ install_ntopng() {
       ;;
     debian)
       case "${VERSION_ID:-}" in
-        11|12|13)
-          repo_version="$VERSION_ID"
+        11)
+          repo_url="https://packages.ntop.org/apt-stable/bullseye/all/apt-ntop-stable.deb"
+          ;;
+        12)
+          repo_url="https://packages.ntop.org/apt-stable/bookworm/all/apt-ntop-stable.deb"
+          ;;
+        13)
+          repo_url="https://packages.ntop.org/apt-stable/trixie/all/apt-ntop-stable.deb"
           ;;
         *)
           die "Unsupported Debian version: ${VERSION_ID:-unknown}. Install ntopng manually, then rerun this installer."
@@ -63,7 +69,6 @@ install_ntopng() {
   trap 'rm -rf "$tmpdir"' RETURN
 
   repo_pkg="$tmpdir/apt-ntop-stable.deb"
-  repo_url="https://packages.ntop.org/apt-stable/$repo_version/all/apt-ntop-stable.deb"
   wget -qO "$repo_pkg" "$repo_url" || die "Failed to download ntop repository package: $repo_url"
   apt-get install -y "$repo_pkg"
   apt-get update
