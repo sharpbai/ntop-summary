@@ -16,6 +16,86 @@ die(){ printf '[ntop-summary] ERROR: %s\n' "$*" >&2; exit 1; }
 command -v python3 >/dev/null || die "python3 is required."
 command -v systemctl >/dev/null || die "systemd is required."
 
+
+install_ntopng() {
+  if command -v ntopng >/dev/null 2>&1; then
+    log "ntopng already installed: $(ntopng --version 2>/dev/null | head -1 || true)"
+    return
+  fi
+
+  [[ -r /etc/os-release ]] || die "Cannot detect Linux distribution (/etc/os-release missing)."
+  . /etc/os-release
+
+  case "${ID:-}" in
+    ubuntu)
+      case "${VERSION_ID:-}" in
+        22.04|24.04)
+          repo_version="$VERSION_ID"
+          ;;
+        *)
+          die "Unsupported Ubuntu version: ${VERSION_ID:-unknown}. Install ntopng manually, then rerun this installer."
+          ;;
+      esac
+      ;;
+    debian)
+      case "${VERSION_ID:-}" in
+        11|12|13)
+          repo_version="$VERSION_ID"
+          ;;
+        *)
+          die "Unsupported Debian version: ${VERSION_ID:-unknown}. Install ntopng manually, then rerun this installer."
+          ;;
+      esac
+      ;;
+    *)
+      die "Automatic ntopng installation currently supports Ubuntu 22.04/24.04 and Debian 11/12/13. Detected: ${PRETTY_NAME:-$ID}"
+      ;;
+  esac
+
+  command -v apt-get >/dev/null || die "apt-get is required for automatic ntopng installation."
+
+  log "ntopng not found. Installing ntop official stable repository for ${PRETTY_NAME:-$ID}..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y ca-certificates wget gnupg
+
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "$tmpdir"' RETURN
+
+  repo_pkg="$tmpdir/apt-ntop-stable.deb"
+  repo_url="https://packages.ntop.org/apt-stable/$repo_version/all/apt-ntop-stable.deb"
+  wget -qO "$repo_pkg" "$repo_url" || die "Failed to download ntop repository package: $repo_url"
+  apt-get install -y "$repo_pkg"
+  apt-get update
+
+  # Ubuntu/Debian may already have the old distro ntopng-data package.
+  # Remove it first if it conflicts with the current ntop official package.
+  if ! apt-get install -y ntopng; then
+    log "Initial ntopng install failed; removing legacy ntopng-data package and retrying."
+    apt-get remove -y ntopng-data 2>/dev/null || true
+    apt-get -f install -y
+    apt-get install -y ntopng
+  fi
+
+  command -v ntopng >/dev/null || die "ntopng installation did not produce an ntopng executable."
+  log "Installed $(ntopng --version 2>/dev/null | head -1 || echo ntopng)."
+
+  systemctl enable ntopng >/dev/null 2>&1 || true
+
+  # Do not invent an interface on multi-NIC hosts. If ntopng already has an
+  # interface configured, start it; otherwise leave it installed and tell the
+  # operator to select the desired interface in /etc/ntopng/ntopng.conf.
+  if grep -RqsE '^[[:space:]]*(-i|--interface)=' /etc/ntopng/ntopng.conf /etc/ntopng/ntopng.conf.d 2>/dev/null; then
+    systemctl restart ntopng
+    log "ntopng started with its existing interface configuration."
+  else
+    log "ntopng installed, but no capture interface is configured."
+    log "Set -i=<interface> in /etc/ntopng/ntopng.conf, then run: systemctl enable --now ntopng"
+  fi
+}
+
+install_ntopng
+
 for f in ntop-summary ntop-collector ntop-tools.conf.example systemd/ntop-collector.service systemd/ntop-collector.timer; do
   [[ -f "$SCRIPT_DIR/$f" ]] || die "Missing repository file: $f"
 done
