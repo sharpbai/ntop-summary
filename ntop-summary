@@ -32,6 +32,7 @@ PORT = CFG.get("NTOP_PORT", "3001")
 USER = CFG.get("NTOP_USER", "admin")
 PASSWORD = CFG.get("NTOP_PASS", "")
 IFID = CFG.get("NTOP_IFID", "1")
+INTERFACE = CFG.get("NTOP_INTERFACE", "").strip()
 PER_PAGE = int(CFG.get("NTOP_PER_PAGE", "5000"))
 DB = CFG.get("NTOP_DB", "/var/lib/ntop-tools/traffic.db")
 BASE = f"https://{HOST}:{PORT}"
@@ -105,12 +106,27 @@ def api(path):
     with urllib.request.urlopen(req, context=CTX, timeout=30) as response:
         return json.load(response)
 
+def resolve_ifid():
+    if not INTERFACE:
+        return IFID
+    if not os.path.exists(f"/sys/class/net/{INTERFACE}"):
+        raise RuntimeError(f"Interface {INTERFACE} is not present")
+    for candidate in range(1, 65):
+        try:
+            rsp=api(f"/lua/rest/v2/get/interface/data.lua?ifid={candidate}").get("rsp",{})
+            if rsp.get("ifname")==INTERFACE:
+                return str(candidate)
+        except Exception:
+            continue
+    raise RuntimeError(f"ntopng is not currently monitoring interface {INTERFACE}")
+
 def get_active_flows():
+    resolved=resolve_ifid()
     page, result = 1, []
     while True:
         rsp = api(
             "/lua/rest/v2/get/flow/active.lua"
-            f"?ifid={IFID}&perPage={PER_PAGE}&currentPage={page}"
+            f"?ifid={resolved}&perPage={PER_PAGE}&currentPage={page}"
         ).get("rsp", {})
         rows = rsp.get("data", [])
         result.extend(rows)
@@ -122,8 +138,9 @@ def get_active_flows():
             raise RuntimeError("Too many API pages")
 
 def interface_summary():
+    resolved=resolve_ifid()
     d = api(
-        f"/lua/rest/v2/get/interface/data.lua?ifid={IFID}"
+        f"/lua/rest/v2/get/interface/data.lua?ifid={resolved}"
     )["rsp"]
     print(f"Interface : {d.get('ifname','-')}")
     print(f"IFID      : {d.get('ifid','-')}")
