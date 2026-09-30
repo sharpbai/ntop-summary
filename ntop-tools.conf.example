@@ -1,0 +1,14 @@
+# ntopng REST API
+NTOP_HOST=127.0.0.1
+NTOP_PORT=3001
+NTOP_USER=admin
+NTOP_PASS=change-me
+
+# ntopng interface ID
+NTOP_IFID=1
+
+# Active-flow API page size
+NTOP_PER_PAGE=5000
+
+# Local historical database
+NTOP_DB=/var/lib/ntop-tools/traffic.db
