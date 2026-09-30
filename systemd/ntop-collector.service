@@ -1,0 +1,8 @@
+[Unit]
+Description=ntopng Traffic Collector
+After=network-online.target ntopng.service
+Wants=network-online.target ntopng.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ntop-collector
