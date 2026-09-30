@@ -205,6 +205,18 @@ Deltas are aggregated into one-minute SQLite buckets, which can later be queried
 
 ## Performance and daily rollups
 
+Long-range queries now use two levels of pre-aggregation.
+
+The detailed `traffic_daily` table is retained for L7 filtering and uncommon mixed queries. In addition, the collector builds compact daily tables matching the common report shapes:
+
+- `traffic_daily_ip_port`
+- `traffic_daily_ip`
+- `traffic_daily_port`
+- `traffic_daily_dst`
+
+This avoids re-grouping high-cardinality `dst_ip/l4/l7` rows for normal `30d`, `month`, and `7d` reports.
+
+
 Long historical queries do not scan all minute-level rows.
 
 The collector maintains a `traffic_daily` rollup table for completed calendar days. Historical queries combine:
