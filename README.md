@@ -43,6 +43,9 @@ The installer works for both new installations and upgrades:
 git clone https://github.com/sharpbai/ntop-summary.git
 cd ntop-summary
 sudo ./install.sh
+
+# Recommended on gateways / dynamic TUN devices:
+sudo ./install.sh --interface tun2socks
 ```
 
 For an existing clone:
@@ -285,6 +288,25 @@ chmod 600 /etc/ntop-tools.conf
 ```
 
 Do not commit the real configuration file. Environment variables named `NTOP_*` override configuration-file values.
+
+### Dynamic interfaces
+
+For TUN/TAP interfaces that can be deleted and recreated, configure the stable interface name instead of relying on a fixed ntopng interface ID:
+
+```ini
+NTOP_INTERFACE=tun2socks
+NTOP_IFID=1
+```
+
+When `NTOP_INTERFACE` is set, `NTOP_IFID` is only a fallback. Both `ntop-summary` and `ntop-collector` resolve the current ntopng interface ID by name on every run. If the Linux interface is temporarily absent, the collector skips that sample without writing bad data.
+
+Install/configure this automatically with:
+
+```bash
+sudo ./install.sh --interface tun2socks
+```
+
+The installer writes a dedicated ntopng drop-in selecting only that interface.
 
 ## License
 
