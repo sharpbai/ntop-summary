@@ -285,9 +285,36 @@ def historical_summary(spec, by, limit, ipf, portf, l7f):
             parts.append("SELECT src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows FROM traffic WHERE bucket>=? AND bucket<?")
             part_params += [int(start.timestamp()), int((start_day + timedelta(days=1)).timestamp())]
 
-        # Complete days from the rollup table.
+        # Choose the smallest daily rollup compatible with the requested
+        # grouping/filter set. L7 filters require the detailed table.
+        compact_table = None
+        compact_select = None
+        if not l7f:
+            if by == "ip-port":
+                compact_table = "traffic_daily_ip_port"
+                compact_select = "src_ip,NULL AS dst_ip,dst_port,'' AS l4,'' AS l7,bytes,new_flows"
+            elif by == "ip" and portf is None:
+                compact_table = "traffic_daily_ip"
+                compact_select = "src_ip,NULL AS dst_ip,0 AS dst_port,'' AS l4,'' AS l7,bytes,new_flows"
+            elif by == "port" and ipf is None:
+                compact_table = "traffic_daily_port"
+                compact_select = "'' AS src_ip,NULL AS dst_ip,dst_port,'' AS l4,'' AS l7,bytes,new_flows"
+            elif by == "dst" and ipf is None:
+                compact_table = "traffic_daily_dst"
+                compact_select = "'' AS src_ip,dst_ip,dst_port,'' AS l4,'' AS l7,bytes,new_flows"
+            elif by == "ip" and portf is not None:
+                compact_table = "traffic_daily_ip_port"
+                compact_select = "src_ip,NULL AS dst_ip,dst_port,'' AS l4,'' AS l7,bytes,new_flows"
+            elif by == "port" and ipf is not None:
+                compact_table = "traffic_daily_ip_port"
+                compact_select = "src_ip,NULL AS dst_ip,dst_port,'' AS l4,'' AS l7,bytes,new_flows"
+
+        # Complete days from a compact rollup when possible.
         if middle_start < middle_end:
-            parts.append("SELECT src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows FROM traffic_daily WHERE day>=? AND day<?")
+            if compact_table:
+                parts.append(f"SELECT {compact_select} FROM {compact_table} WHERE day>=? AND day<?")
+            else:
+                parts.append("SELECT src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows FROM traffic_daily WHERE day>=? AND day<?")
             part_params += [middle_start, middle_end]
 
         # Last partial/current day.
