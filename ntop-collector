@@ -20,7 +20,7 @@ def load_config():
 CFG=load_config()
 HOST=CFG.get("NTOP_HOST","127.0.0.1"); PORT=CFG.get("NTOP_PORT","3001")
 USER=CFG.get("NTOP_USER","admin"); PASSWORD=CFG.get("NTOP_PASS","")
-IFID=CFG.get("NTOP_IFID","1"); PER_PAGE=int(CFG.get("NTOP_PER_PAGE","5000"))
+IFID=CFG.get("NTOP_IFID","1"); INTERFACE=CFG.get("NTOP_INTERFACE","").strip(); PER_PAGE=int(CFG.get("NTOP_PER_PAGE","5000"))
 DB=CFG.get("NTOP_DB","/var/lib/ntop-tools/traffic.db")
 BASE=f"https://{HOST}:{PORT}"; CTX=ssl._create_unverified_context()
 
@@ -182,10 +182,30 @@ def refresh_completed_days(con,now):
         day+=86400; count+=1
     return count
 
+def resolve_ifid():
+    if not INTERFACE:
+        return IFID
+    if not os.path.exists(f"/sys/class/net/{INTERFACE}"):
+        return None
+    # ntopng interface IDs are normally small. Probe the REST interface
+    # endpoint because it is stable across ntopng restarts/re-numbering.
+    for candidate in range(1, 65):
+        try:
+            data=api(f"/lua/rest/v2/get/interface/data.lua?ifid={candidate}")
+            rsp=data.get("rsp",{})
+            if rsp.get("ifname")==INTERFACE:
+                return str(candidate)
+        except Exception:
+            continue
+    return None
+
 def get_flows():
+    resolved=resolve_ifid()
+    if resolved is None:
+        return None
     page=1; result=[]
     while True:
-        rsp=api("/lua/rest/v2/get/flow/active.lua"+f"?ifid={IFID}&perPage={PER_PAGE}&currentPage={page}").get("rsp",{})
+        rsp=api("/lua/rest/v2/get/flow/active.lua"+f"?ifid={resolved}&perPage={PER_PAGE}&currentPage={page}").get("rsp",{})
         rows=rsp.get("data",[]); result.extend(rows)
         if not rows or len(result)>=int(rsp.get("totalRows",len(result))): return result
         page+=1
@@ -195,7 +215,11 @@ def flow_id(row):
     return "{}:{}:{}".format(row.get("key",""),row.get("hash_id",""),row.get("first_seen",""))
 
 def collect():
-    now=int(time.time()); bucket=now-now%60; flows=get_flows(); con=db_connect()
+    now=int(time.time()); bucket=now-now%60; flows=get_flows()
+    if flows is None:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} interface={INTERFACE or IFID} unavailable; collection skipped")
+        return
+    con=db_connect()
     total_delta=0; new_flows=0
     with con:
         for row in flows:
