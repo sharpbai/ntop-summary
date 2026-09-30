@@ -8,6 +8,20 @@ DATADIR="/var/lib/ntop-tools"
 DB="$DATADIR/traffic.db"
 UNITDIR="/etc/systemd/system"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MONITOR_INTERFACE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --interface)
+      [[ $# -ge 2 ]] || die "--interface requires an interface name"
+      MONITOR_INTERFACE="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: sudo ./install.sh [--interface INTERFACE]"
+      exit 0 ;;
+    *)
+      die "Unknown option: $1" ;;
+  esac
+done
 
 log(){ printf '[ntop-summary] %s\n' "$*"; }
 die(){ printf '[ntop-summary] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -105,6 +119,29 @@ for f in ntop-summary ntop-collector ntop-tools.conf.example systemd/ntop-collec
   [[ -f "$SCRIPT_DIR/$f" ]] || die "Missing repository file: $f"
 done
 
+if [[ -n "$MONITOR_INTERFACE" ]]; then
+  [[ -e "/sys/class/net/$MONITOR_INTERFACE" ]] || log "WARNING: interface $MONITOR_INTERFACE does not currently exist; it may be a dynamic TUN/TAP device."
+
+  # Keep the capture selection in a dedicated drop-in so package upgrades do
+  # not overwrite it. ntopng concatenates ntopng.conf.d/*.conf.
+  install -d -m 0755 /etc/ntopng/ntopng.conf.d
+  printf '%s\n' "-i=$MONITOR_INTERFACE" > /etc/ntopng/ntopng.conf.d/90-ntop-summary-interface.conf
+
+  # Remove uncommented interface selections from the main config and other
+  # ntop-summary drop-ins to avoid accidentally capturing every NIC.
+  if [[ -f /etc/ntopng/ntopng.conf ]]; then
+    sed -i -E '/^[[:space:]]*(-i|--interface)=/d' /etc/ntopng/ntopng.conf
+  fi
+
+  systemctl enable ntopng >/dev/null 2>&1 || true
+  if [[ -e "/sys/class/net/$MONITOR_INTERFACE" ]]; then
+    systemctl restart ntopng
+    log "Configured ntopng to monitor $MONITOR_INTERFACE."
+  else
+    log "Configured ntopng for $MONITOR_INTERFACE; ntopng will need restarting after the interface appears."
+  fi
+fi
+
 install -d -m 0755 "$BINDIR"
 install -d -m 0700 "$DATADIR"
 install -m 0755 "$SCRIPT_DIR/ntop-summary" "$BINDIR/ntop-summary"
@@ -116,6 +153,15 @@ if [[ ! -f "$CONFIG" ]]; then
 else
   chmod 0600 "$CONFIG"
   log "Keeping existing $CONFIG."
+fi
+
+if [[ -n "$MONITOR_INTERFACE" ]]; then
+  if grep -q '^NTOP_INTERFACE=' "$CONFIG"; then
+    sed -i "s|^NTOP_INTERFACE=.*|NTOP_INTERFACE=$MONITOR_INTERFACE|" "$CONFIG"
+  else
+    printf '\nNTOP_INTERFACE=%s\n' "$MONITOR_INTERFACE" >> "$CONFIG"
+  fi
+  log "Configured ntop tools to resolve $MONITOR_INTERFACE dynamically."
 fi
 
 # Respect an existing custom DB path from the config.
