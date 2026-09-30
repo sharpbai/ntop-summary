@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+import base64
+import json
+import os
+import sqlite3
+import ssl
+import sys
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+CONFIG = "/etc/ntop-tools.conf"
+
+def load_config():
+    cfg = {}
+    if os.path.exists(CONFIG):
+        with open(CONFIG, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    for k, v in os.environ.items():
+        if k.startswith("NTOP_"):
+            cfg[k] = v
+    return cfg
+
+CFG = load_config()
+HOST = CFG.get("NTOP_HOST", "127.0.0.1")
+PORT = CFG.get("NTOP_PORT", "3001")
+USER = CFG.get("NTOP_USER", "admin")
+PASSWORD = CFG.get("NTOP_PASS", "")
+IFID = CFG.get("NTOP_IFID", "1")
+PER_PAGE = int(CFG.get("NTOP_PER_PAGE", "5000"))
+DB = CFG.get("NTOP_DB", "/var/lib/ntop-tools/traffic.db")
+BASE = f"https://{HOST}:{PORT}"
+CTX = ssl._create_unverified_context()
+
+def help_text():
+    print("""ntop-summary - ntopng traffic summary CLI
+
+Usage:
+  ntop-summary interface
+  ntop-summary live
+  ntop-summary today
+  ntop-summary month
+  ntop-summary 7d
+  ntop-summary 30d
+  ntop-summary YYYY-MM-DD
+  ntop-summary YYYY-MM-DD YYYY-MM-DD
+  ntop-summary db
+
+Grouping:
+  --by ip-port    source IP + destination port (default)
+  --by ip         source IP
+  --by port       destination port
+  --by dst        destination IP + destination port
+
+Filters:
+  --ip ADDRESS
+  --port PORT
+  --l7 PROTOCOL
+
+Output:
+  --limit 30      default
+  --limit 0       unlimited
+
+Examples:
+  ntop-summary month
+  ntop-summary month --by ip
+  ntop-summary month --by port
+  ntop-summary 7d --port 9009
+  ntop-summary today --ip 123.119.146.106
+  ntop-summary 30d --l7 BitTorrent
+  ntop-summary live --by port
+
+month = current calendar month; 30d = rolling last 30 days.
+Historical queries use the SQLite database built by ntop-collector.""")
+
+def human_bytes(n):
+    n = float(n or 0)
+    units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+    i = 0
+    while n >= 1024 and i < len(units) - 1:
+        n /= 1024
+        i += 1
+    return f"{n:.2f} {units[i]}"
+
+def human_rate(n):
+    n = float(n or 0)
+    units = ["bps", "Kbps", "Mbps", "Gbps"]
+    i = 0
+    while n >= 1000 and i < len(units) - 1:
+        n /= 1000
+        i += 1
+    return f"{n:.2f} {units[i]}"
+
+def api(path):
+    if not PASSWORD:
+        raise RuntimeError("NTOP_PASS is not configured")
+    req = urllib.request.Request(BASE + path)
+    token = base64.b64encode(f"{USER}:{PASSWORD}".encode()).decode()
+    req.add_header("Authorization", f"Basic {token}")
+    with urllib.request.urlopen(req, context=CTX, timeout=30) as response:
+        return json.load(response)
+
+def get_active_flows():
+    page, result = 1, []
+    while True:
+        rsp = api(
+            "/lua/rest/v2/get/flow/active.lua"
+            f"?ifid={IFID}&perPage={PER_PAGE}&currentPage={page}"
+        ).get("rsp", {})
+        rows = rsp.get("data", [])
+        result.extend(rows)
+        total = int(rsp.get("totalRows", len(result)))
+        if not rows or len(result) >= total:
+            return result
+        page += 1
+        if page > 1000:
+            raise RuntimeError("Too many API pages")
+
+def interface_summary():
+    d = api(
+        f"/lua/rest/v2/get/interface/data.lua?ifid={IFID}"
+    )["rsp"]
+    print(f"Interface : {d.get('ifname','-')}")
+    print(f"IFID      : {d.get('ifid','-')}")
+    print(f"Uptime    : {d.get('uptime','-')}")
+    print("\nTraffic since ntopng startup")
+    print(f"Total     : {human_bytes(d.get('bytes'))}")
+    print(f"Download  : {human_bytes(d.get('bytes_download'))}")
+    print(f"Upload    : {human_bytes(d.get('bytes_upload'))}")
+    t = d.get("throughput", {})
+    print("\nCurrent throughput")
+    print("Download  :", human_rate(t.get("download", {}).get("bps")))
+    print("Upload    :", human_rate(t.get("upload", {}).get("bps")))
+    print("Total     :", human_rate(d.get("throughput_bps")))
+    print("\nCounters")
+    print(f"Packets   : {d.get('packets',0):,}")
+    print(f"Flows     : {d.get('num_flows',0):,}")
+    print(f"Hosts     : {d.get('num_hosts',0):,}")
+    print(f"LocalHost : {d.get('num_local_hosts',0):,}")
+    print(f"Drops     : {d.get('tot_pkt_drops',0):,}")
+
+def parse_options(args):
+    by, limit, ipf, portf, l7f = "ip-port", 30, None, None, None
+    cleaned, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--by", "--limit", "--ip", "--port", "--l7"):
+            i += 1
+            if i >= len(args):
+                raise ValueError(f"{a} requires a value")
+            v = args[i]
+            if a == "--by": by = v
+            elif a == "--limit": limit = int(v)
+            elif a == "--ip": ipf = v
+            elif a == "--port": portf = int(v)
+            elif a == "--l7": l7f = v
+        else:
+            cleaned.append(a)
+        i += 1
+    if by not in ("ip-port", "ip", "port", "dst"):
+        raise ValueError("--by must be ip-port, ip, port, or dst")
+    if limit < 0:
+        raise ValueError("--limit cannot be negative")
+    return cleaned, by, limit, ipf, portf, l7f
+
+def print_rows(rows, by, limit):
+    if limit > 0:
+        rows = rows[:limit]
+    if by == "ip-port":
+        print(f"{'SOURCE IP':<40} {'DPORT':>7} {'FLOWS':>8} {'TRAFFIC':>14}")
+        print("-" * 74)
+        for src, port, flows, b in rows:
+            print(f"{src:<40} {port:>7} {flows:>8} {human_bytes(b):>14}")
+    elif by == "ip":
+        print(f"{'SOURCE IP':<40} {'FLOWS':>8} {'TRAFFIC':>14}")
+        print("-" * 66)
+        for src, flows, b in rows:
+            print(f"{src:<40} {flows:>8} {human_bytes(b):>14}")
+    elif by == "port":
+        print(f"{'DPORT':>7} {'FLOWS':>8} {'TRAFFIC':>14}")
+        print("-" * 34)
+        for port, flows, b in rows:
+            print(f"{port:>7} {flows:>8} {human_bytes(b):>14}")
+    else:
+        print(f"{'DESTINATION':<40} {'DPORT':>7} {'FLOWS':>8} {'TRAFFIC':>14}")
+        print("-" * 74)
+        for dst, port, flows, b in rows:
+            print(f"{dst:<40} {port:>7} {flows:>8} {human_bytes(b):>14}")
+
+def live_summary(by, limit, ipf, portf, l7f):
+    flows = get_active_flows()
+    agg = defaultdict(lambda: [0, 0])
+    matched = 0
+    for r in flows:
+        c, s, p = r.get("client", {}), r.get("server", {}), r.get("protocol", {})
+        src, dst = str(c.get("ip","") or ""), str(s.get("ip","") or "")
+        port = int(s.get("port",0) or 0)
+        l7, b = str(p.get("l7","") or ""), int(r.get("bytes",0) or 0)
+        if ipf and src != ipf: continue
+        if portf is not None and port != portf: continue
+        if l7f and l7.lower() != l7f.lower(): continue
+        matched += 1
+        key = (src, port) if by == "ip-port" else (src,) if by == "ip" else (port,) if by == "port" else (dst, port)
+        agg[key][0] += 1
+        agg[key][1] += b
+    rows = [(*key, v[0], v[1]) for key, v in agg.items()]
+    rows.sort(key=lambda x: x[-1], reverse=True)
+    print(f"Active flows : {len(flows):,}")
+    if ipf or portf is not None or l7f:
+        print(f"Matched      : {matched:,}")
+    print()
+    print_rows(rows, by, limit)
+
+def get_range(spec):
+    now = datetime.now()
+    if not spec or spec[0] == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0), now
+    if spec[0] == "month":
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0), now
+    if spec[0] == "7d":
+        return now - timedelta(days=7), now
+    if spec[0] == "30d":
+        return now - timedelta(days=30), now
+    try:
+        start = datetime.strptime(spec[0], "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("Use today, month, 7d, 30d, or YYYY-MM-DD") from exc
+    if len(spec) >= 2:
+        end_day = datetime.strptime(spec[1], "%Y-%m-%d")
+        if end_day < start:
+            raise ValueError("End date cannot be earlier than start date")
+        return start, end_day + timedelta(days=1) - timedelta(seconds=1)
+    return start, start + timedelta(days=1) - timedelta(seconds=1)
+
+def historical_summary(spec, by, limit, ipf, portf, l7f):
+    if not os.path.exists(DB):
+        raise RuntimeError("Historical DB does not exist; run ntop-collector first")
+    start, end = get_range(spec)
+    where = ["bucket >= ?", "bucket <= ?"]
+    params = [int(start.timestamp()), int(end.timestamp())]
+    if ipf: where.append("src_ip = ?"); params.append(ipf)
+    if portf is not None: where.append("dst_port = ?"); params.append(portf)
+    if l7f: where.append("LOWER(l7) = LOWER(?)"); params.append(l7f)
+
+    if by == "ip-port": cols = group = "src_ip, dst_port"
+    elif by == "ip": cols = group = "src_ip"
+    elif by == "port": cols = group = "dst_port"
+    else: cols = group = "dst_ip, dst_port"
+
+    sql = f"""SELECT {cols}, SUM(new_flows), SUM(bytes)
+              FROM traffic WHERE {' AND '.join(where)}
+              GROUP BY {group} ORDER BY SUM(bytes) DESC"""
+    if limit > 0:
+        sql += f" LIMIT {limit}"
+
+    con = sqlite3.connect(DB, timeout=30)
+    rows = con.execute(sql, params).fetchall()
+    total_b, total_f = con.execute(
+        f"SELECT COALESCE(SUM(bytes),0),COALESCE(SUM(new_flows),0) FROM traffic WHERE {' AND '.join(where)}",
+        params
+    ).fetchone()
+    con.close()
+
+    print(f"Period  : {start:%Y-%m-%d %H:%M:%S} ~ {end:%Y-%m-%d %H:%M:%S}")
+    print(f"Traffic : {human_bytes(total_b)}")
+    print(f"Flows   : {total_f:,}\n")
+    print_rows(rows, by, 0)
+
+def db_status():
+    if not os.path.exists(DB):
+        print(f"Database does not exist: {DB}")
+        return
+    con = sqlite3.connect(DB, timeout=30)
+    rows, b, first, last = con.execute(
+        "SELECT COUNT(*),COALESCE(SUM(bytes),0),MIN(bucket),MAX(bucket) FROM traffic"
+    ).fetchone()
+    states = con.execute("SELECT COUNT(*) FROM flow_state").fetchone()[0]
+    con.close()
+    print(f"Database    : {DB}")
+    print(f"Rows        : {rows:,}")
+    print(f"Flow states : {states:,}")
+    print(f"Traffic     : {human_bytes(b)}")
+    if first: print("First       :", datetime.fromtimestamp(first).strftime("%Y-%m-%d %H:%M:%S"))
+    if last: print("Last        :", datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M:%S"))
+
+def main():
+    if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
+        help_text(); return
+    args, by, limit, ipf, portf, l7f = parse_options(sys.argv[1:])
+    if not args:
+        help_text(); return
+    mode = args[0]
+    if mode == "interface":
+        interface_summary()
+    elif mode == "live":
+        live_summary(by, limit, ipf, portf, l7f)
+    elif mode == "db":
+        db_status()
+    else:
+        historical_summary(args, by, limit, ipf, portf, l7f)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
