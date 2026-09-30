@@ -259,6 +259,65 @@ def historical_summary(spec, by, limit, ipf, portf, l7f):
         sql += f" LIMIT {limit}"
 
     con = sqlite3.connect(DB, timeout=30)
+    con.execute("PRAGMA temp_store=MEMORY")
+    con.execute("PRAGMA cache_size=-65536")
+
+    # Fast path: use daily rollups for complete days, plus minute data
+    # for partial boundary days. This keeps today precise while avoiding
+    # scanning millions of minute rows for 7d/30d/month queries.
+    start_day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_day = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_exists = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='traffic_daily'"
+    ).fetchone() is not None
+
+    if daily_exists and start_day < end_day:
+        middle_start = int((start_day + timedelta(days=1)).timestamp())
+        middle_end = int(end_day.timestamp())
+        parts = []
+        part_params = []
+
+        # First partial day. If the range starts exactly at midnight it can
+        # also be served by the daily table.
+        if start == start_day:
+            middle_start = int(start_day.timestamp())
+        else:
+            parts.append("SELECT src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows FROM traffic WHERE bucket>=? AND bucket<?")
+            part_params += [int(start.timestamp()), int((start_day + timedelta(days=1)).timestamp())]
+
+        # Complete days from the rollup table.
+        if middle_start < middle_end:
+            parts.append("SELECT src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows FROM traffic_daily WHERE day>=? AND day<?")
+            part_params += [middle_start, middle_end]
+
+        # Last partial/current day.
+        parts.append("SELECT src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows FROM traffic WHERE bucket>=? AND bucket<=?")
+        part_params += [int(end_day.timestamp()), int(end.timestamp())]
+
+        source_sql = " UNION ALL ".join(parts)
+        filter_clauses = []
+        filter_params = []
+        if ipf: filter_clauses.append("src_ip = ?"); filter_params.append(ipf)
+        if portf is not None: filter_clauses.append("dst_port = ?"); filter_params.append(portf)
+        if l7f: filter_clauses.append("LOWER(l7) = LOWER(?)"); filter_params.append(l7f)
+        outer_where = (" WHERE " + " AND ".join(filter_clauses)) if filter_clauses else ""
+
+        fast_sql = f"""SELECT {cols},SUM(new_flows),SUM(bytes)
+                       FROM ({source_sql}){outer_where}
+                       GROUP BY {group} ORDER BY SUM(bytes) DESC"""
+        if limit > 0: fast_sql += f" LIMIT {limit}"
+        rows = con.execute(fast_sql, part_params + filter_params).fetchall()
+        total_b,total_f = con.execute(
+            f"SELECT COALESCE(SUM(bytes),0),COALESCE(SUM(new_flows),0) FROM ({source_sql}){outer_where}",
+            part_params + filter_params
+        ).fetchone()
+        con.close()
+        print(f"Period  : {start:%Y-%m-%d %H:%M:%S} ~ {end:%Y-%m-%d %H:%M:%S}")
+        print(f"Traffic : {human_bytes(total_b)}")
+        print(f"Flows   : {total_f:,}\n")
+        print_rows(rows, by, 0)
+        return
+
     rows = con.execute(sql, params).fetchall()
     total_b, total_f = con.execute(
         f"SELECT COALESCE(SUM(bytes),0),COALESCE(SUM(new_flows),0) FROM traffic WHERE {' AND '.join(where)}",
