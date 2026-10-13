@@ -32,7 +32,7 @@ def classify(ip, networks, excluded):
         return "candidate"
     return "remote"
 
-def normalize(record, local_networks, excluded):
+def normalize(record, local_networks, excluded, servers=None, ports=None):
     try:
         src = str(ipaddress.ip_address(record["ip_src"]))
         dst = str(ipaddress.ip_address(record["ip_dst"]))
@@ -44,6 +44,12 @@ def normalize(record, local_networks, excluded):
         return None
     if size < 0 or not 0 <= sp <= 65535 or not 0 <= dp <= 65535:
         return None
+    if servers and ports:
+        if dst in servers and dp in ports and src not in servers:
+            return 'attributed', (src, dst, dp, proto, size), size
+        if src in servers and sp in ports and dst not in servers:
+            return 'attributed', (dst, src, sp, proto, size), size
+        return 'unclassified', None, size
     a = classify(src, local_networks, excluded)
     b = classify(dst, local_networks, excluded)
     if "excluded" in (a, b):
@@ -79,7 +85,7 @@ def init_db(con):
     );
     """)
 
-def import_file(con, path, nets, excluded, min_age):
+def import_file(con, path, nets, excluded, min_age, servers=None, ports=None):
     if time.time() - path.stat().st_mtime < min_age:
         return False, 0, 0, 0
     # Timestamp is the *end* of the completed print interval.
@@ -106,7 +112,7 @@ def import_file(con, path, nets, excluded, min_age):
         if not line.strip():
             continue
         item = json.loads(line)
-        value = normalize(item, nets, excluded)
+        value = normalize(item, nets, excluded, servers, ports)
         if value is None:
             accounting["invalid"][0] += 1
             try:
@@ -156,6 +162,8 @@ def main():
     p.add_argument("--local-networks", help="Comma-separated client networks")
     p.add_argument("--prefix", default="pmacct-")
     p.add_argument("--exclude-networks", help="Comma-separated excluded CIDRs")
+    p.add_argument("--server-addresses", help="Local service IP addresses, comma-separated")
+    p.add_argument("--service-ports", help="Ingress service ports, comma-separated")
     p.add_argument("--min-age", type=int, default=120, help="Minimum file age in seconds")
     p.add_argument("--accounting", action="store_true", help="Show attribution statistics")
     p.add_argument("--allow-production", action="store_true", help="Allow production DB after migration")
@@ -167,6 +175,13 @@ def main():
             for s in network_text.split(",") if s.strip()]
     excluded_text = args.exclude_networks or cfg.get("PMACCT_EXCLUDE_NETWORKS", "")
     excluded = [ipaddress.ip_network(x.strip(), strict=False) for x in excluded_text.split(",") if x.strip()]
+    servers_text = args.server_addresses or cfg.get("PMACCT_SERVER_ADDRESSES", "")
+    ports_text = args.service_ports or cfg.get("PMACCT_SERVICE_PORTS", "")
+    if bool(servers_text) != bool(ports_text):
+        p.error("Ingress mode requires both server addresses and service ports")
+    servers = {str(ipaddress.ip_address(x.strip())) for x in servers_text.split(",") if x.strip()}
+    ports = {int(x.strip()) for x in ports_text.split(",") if x.strip()}
+    if any(port < 1 or port > 65535 for port in ports): p.error("Invalid service port")
     if not args.allow_production and Path(args.db).resolve() == Path(cfg.get("NTOP_DB",
              "/var/lib/ntop-tools/traffic.db")).resolve():
         p.error("Refusing to write to the production ntopng database")
@@ -182,7 +197,7 @@ def main():
         return
     for path in sorted(Path(args.input_dir).glob(args.prefix + "*.json")):
         try:
-            changed, count, size, skipped = import_file(con, path, nets, excluded, args.min_age)
+            changed, count, size, skipped = import_file(con, path, nets, excluded, args.min_age, servers, ports)
             if changed:
                 print(f"{path.name}: rows={count} bytes={size} skipped={skipped}")
         except (OSError, ValueError, json.JSONDecodeError) as exc:
