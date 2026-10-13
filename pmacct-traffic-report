@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Read-only daily traffic summary from the unified ntop-summary SQLite database."""
+import argparse
+import datetime as dt
+import sqlite3
+from pathlib import Path
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--db", default="/var/lib/ntop-tools/traffic.db")
+    p.add_argument("--days", type=int, default=30)
+    p.add_argument("--by", choices=["day","ip","port","ip-port"], default="day")
+    p.add_argument("--limit", type=int, default=30)
+    args = p.parse_args()
+    if not Path(args.db).exists():
+        p.error("Database does not exist")
+    if args.days < 1 or args.limit < 0:
+        p.error("--days must be positive; --limit cannot be negative")
+    today = dt.datetime.now().replace(hour=0,minute=0,second=0,microsecond=0)
+    start = int((today-dt.timedelta(days=args.days-1)).timestamp())
+    cols = {"day":"date(bucket,'unixepoch','localtime')","ip":"src_ip","port":"dst_port","ip-port":"src_ip,dst_port"}[args.by]
+    with sqlite3.connect("file:"+str(Path(args.db).resolve())+"?mode=ro",uri=True) as con:
+        sql = f"SELECT {cols},SUM(bytes) FROM traffic WHERE bucket>=? GROUP BY {cols} ORDER BY SUM(bytes) DESC"
+        if args.by=="day":
+            sql = f"SELECT {cols},SUM(bytes) FROM traffic WHERE bucket>=? GROUP BY {cols} ORDER BY {cols} DESC"
+        if args.limit: sql += " LIMIT "+str(args.limit)
+        for row in con.execute(sql,(start,)):
+            *keys, count = row
+            print("  ".join(map(str,keys)),f"{count:,} B",f"({count/1024**3:.3f} GiB)")
+        total = con.execute("SELECT COALESCE(SUM(bytes),0) FROM traffic WHERE bucket>=?",(start,)).fetchone()[0]
+        print(f"TOTAL {total:,} B ({total/1024**3:.3f} GiB) since {dt.datetime.fromtimestamp(start)}")
+
+if __name__=="__main__":
+    main()
