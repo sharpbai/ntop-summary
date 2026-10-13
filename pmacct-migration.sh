@@ -45,7 +45,9 @@ PY
     echo "Stopping both writers; capture remains running."
     systemctl stop ntop-collector.timer pmacct-import.timer
     systemctl stop ntop-collector.service pmacct-import.service || true
-    if ! python3 "$ROOT/pmacct-migrate" --production "$DB" --staging "$STAGING" ${CUTOFF:+--cutoff "$CUTOFF"}; then
+    cutoff_args=()
+    if [[ -n "${CUTOFF:-}" ]]; then cutoff_args=(--cutoff "$CUTOFF"); fi
+    if ! python3 "$ROOT/pmacct-migrate" --production "$DB" --staging "$STAGING" "${cutoff_args[@]}"; then
       echo "Migration failed; restore the old timer after investigating. No automatic rollback of committed data." >&2
       exit 1
     fi
