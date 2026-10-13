@@ -1,0 +1,14 @@
+[Unit]
+Description=pmacct lightweight traffic accounting for ntop-summary
+After=network.target
+ConditionPathExists=/sys/class/net/tun2socks
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/pmacctd -i tun2socks -f /etc/pmacct/ntop-summary.conf
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
