@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Repair overlapping ntopng + pmacct minute buckets using an independently rebuilt pmacct database.
+
+Requires a verified pmacct-only staging DB covering the entire requested interval.
+Stops neither service; caller must stop the import timer during repair.
+Creates SQLite online backup and runs the replacement in a single transaction.
+"""
+import argparse
+import datetime
+import sqlite3
+import sys
+from pathlib import Path
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--production",default="/var/lib/ntop-tools/traffic.db")
+    p.add_argument("--pmacct-only",required=True)
+    p.add_argument("--start",type=int,required=True)
+    p.add_argument("--end",type=int,required=True)
+    p.add_argument("--execute",action="store_true")
+    a=p.parse_args()
+    if a.start%60 or a.end%60 or a.start>=a.end: p.error("Minute-aligned start < end required")
+    if Path(a.production).resolve()==Path(a.pmacct_only).resolve(): p.error("Distinct databases required")
+    prod=sqlite3.connect(a.production,timeout=60,isolation_level=None)
+    prod.execute("PRAGMA busy_timeout=60000")
+    prod.execute("ATTACH DATABASE ? AS rebuilt",(a.pmacct_only,))
+    try:
+        expected=(a.end-a.start)//60
+        files=prod.execute("""SELECT filename FROM rebuilt.pmacct_imports
+          WHERE substr(filename,1,7)='pmacct-' ORDER BY filename""").fetchall()
+        buckets=prod.execute("""SELECT COUNT(DISTINCT bucket),MIN(bucket),MAX(bucket),COALESCE(SUM(bytes),0)
+          FROM rebuilt.traffic WHERE bucket>=? AND bucket<?""",(a.start,a.end)).fetchone()
+        old=prod.execute("""SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM traffic
+          WHERE bucket>=? AND bucket<?""",(a.start,a.end)).fetchone()
+        print("Window:",datetime.datetime.fromtimestamp(a.start), "to",datetime.datetime.fromtimestamp(a.end),flush=True)
+        print("Existing:",old,"Rebuilt:",buckets,"Raw files:",len(files),flush=True)
+        if buckets[0]!=expected or buckets[1]!=a.start or buckets[2]!=a.end-60:
+            raise RuntimeError("Rebuilt minute coverage incomplete; refusing replacement")
+        if not a.execute:
+            print("DRY RUN: pass --execute after reviewing",flush=True)
+            return
+        backup=Path(a.production).with_name(Path(a.production).name+".pre-dedupe-"+datetime.datetime.now().strftime("%Y%m%d-%H%M%S")+".bak")
+        with sqlite3.connect(str(backup)) as out:
+            prod.backup(out,pages=500,sleep=0.05)
+        print("BACKUP:",backup,flush=True)
+        prod.execute("BEGIN IMMEDIATE")
+        try:
+            prod.execute("DELETE FROM traffic WHERE bucket>=? AND bucket<?",(a.start,a.end))
+            prod.execute("""INSERT INTO traffic(bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows)
+              SELECT bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows
+              FROM rebuilt.traffic WHERE bucket>=? AND bucket<?""",(a.start,a.end))
+            prod.execute("COMMIT")
+        except Exception:
+            prod.execute("ROLLBACK")
+            raise
+        after=prod.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0) FROM traffic WHERE bucket>=? AND bucket<?",(a.start,a.end)).fetchone()
+        print("AFTER:",after,"REMOVED_DUPLICATE_BYTES:",old[1]-after[1],flush=True)
+    finally:
+        prod.close()
+
+if __name__=="__main__":
+    main()
