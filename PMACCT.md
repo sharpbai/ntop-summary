@@ -79,3 +79,19 @@ sudo journalctl -u pmacct-import.service -n 30 --no-pager
 The old ntopng timer remains enabled during this phase. Never write pmacct data into `traffic.db` until migration and reporting compatibility have been verified. Do not delete JSON files unless their import has been confirmed.
 
 **Important limitations:** The watcher uses periodic sysfs checks rather than an event-driven netlink socket. It catches recreated ifindex changes and disappearance/reappearance, but very fast changes between checks can be missed. The health check also depends on regular output and traffic movement. The current importer assigns a 60-second output interval to the minute preceding the file timestamp; it does not yet split non-aligned intervals across minute boundaries. Historical totals are usable for validation, but exact per-minute boundaries need improvement before production cutover.
+
+
+## Production migration on local-57 (2026-10-13)
+
+After approximately 40 minutes of parallel collection, a common 20-minute interval differed by only ~0.18% between the two backends. Migration proceeded as follows:
+
+1. Stop `ntop-collector.timer` and `pmacct-import.timer`, leaving pmacct capture running.
+2. Run `python3 pmacct-migrate`. It creates a SQLite online backup `traffic.db.pre-pmacct-*.bak`, then transactionally replaces only traffic buckets at/after the chosen cutover minute with the staging backend's rows. It also transfers imported-file markers and attribution metadata to prevent duplicate imports.
+3. Install the updated `pmacct-collector` and `pmacct-import.service` (with `--db /var/lib/ntop-tools/traffic.db --allow-production`), enable the import timer, and verify a successful new import.
+4. Disable and stop `ntop-collector.timer` and `ntopng.service`.
+
+The historical SQLite path remains `/var/lib/ntop-tools/traffic.db`, so `ntop-summary today/month/30d` continue to work. The backup is retained for rollback. JSON files are retained for 48 hours by default and only pruned if their SHA-256 matches a successfully imported file.
+
+**Known compatibility differences:** pmacct packet aggregation does not provide ntopng L7 application classification or new-flow counts. For pmacct-era records, `l7` is empty and `new_flows` is zero. `ntop-summary interface` and `ntop-summary live` still depend on the ntopng REST API and are unavailable when ntopng is stopped; historical queries continue to work. These commands need backend-specific implementations if required. The current time-bucket assignment uses print output end timestamps and is not a packet-level timestamp.
+
+**Rollback:** disable `pmacct-import.timer`, re-enable `ntopng.service` and `ntop-collector.timer`, and restore the backup only after stopping writers and explicitly deciding whether to discard pmacct-era writes. Do not copy a SQLite backup over an actively open WAL database.
