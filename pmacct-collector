@@ -70,6 +70,8 @@ def init_db(con):
       dst_port INTEGER NOT NULL, l4 TEXT NOT NULL DEFAULT '',
       l7 TEXT NOT NULL DEFAULT '', bytes INTEGER NOT NULL DEFAULT 0,
       new_flows INTEGER NOT NULL DEFAULT 0,
+      upload_bytes INTEGER NOT NULL DEFAULT 0,
+      download_bytes INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(bucket,src_ip,dst_ip,dst_port,l4,l7)
     );
     CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic(bucket);
@@ -84,6 +86,12 @@ def init_db(con):
       PRIMARY KEY(filename, category)
     );
     """)
+    # Existing production databases retain historical total bytes. The direction
+    # columns are zero for legacy rows: zero means unknown, NOT zero traffic.
+    columns = {row[1] for row in con.execute("PRAGMA table_info(traffic)")}
+    for column in ("upload_bytes", "download_bytes"):
+        if column not in columns:
+            con.execute(f"ALTER TABLE traffic ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
 
 def import_file(con, path, nets, excluded, min_age, servers=None, ports=None):
     if time.time() - path.stat().st_mtime < min_age:
@@ -135,7 +143,14 @@ def import_file(con, path, nets, excluded, min_age, servers=None, ports=None):
             continue
         src, dst, port, proto, size = payload
         key = (bucket, src, dst, port, proto, "")
-        aggregates[key] = aggregates.get(key, 0) + size
+        # Packet direction relative to the attributed client, not the interface.
+        # Client -> server = upload; server -> client = download.
+        up, down = aggregates.get(key, (0, 0))
+        if str(ipaddress.ip_address(item["ip_src"])) == src:
+            up += size
+        else:
+            down += size
+        aggregates[key] = (up, down)
         rows += 1
         total += size
     with con:
@@ -146,11 +161,13 @@ def import_file(con, path, nets, excluded, min_age, servers=None, ports=None):
                 raise ValueError(f"Already imported file changed: {path.name}")
             return False, 0, 0, 0
         con.executemany("""
-          INSERT INTO traffic(bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows)
-          VALUES(?,?,?,?,?,?,?,0)
+          INSERT INTO traffic(bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows,upload_bytes,download_bytes)
+          VALUES(?,?,?,?,?,?,?,0,?,?)
           ON CONFLICT(bucket,src_ip,dst_ip,dst_port,l4,l7)
-          DO UPDATE SET bytes=bytes+excluded.bytes
-        """, [(*k, value) for k, value in aggregates.items()])
+          DO UPDATE SET bytes=bytes+excluded.bytes,
+            upload_bytes=upload_bytes+excluded.upload_bytes,
+            download_bytes=download_bytes+excluded.download_bytes
+        """, [(*k, up+down, up, down) for k, (up, down) in aggregates.items()])
         con.executemany("""INSERT INTO pmacct_accounting
           (filename,category,records,bytes) VALUES(?,?,?,?)""",
           [(path.name, category, values[0], values[1]) for category, values in accounting.items()])
