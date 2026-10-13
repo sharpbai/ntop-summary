@@ -4,4 +4,4 @@ After=pmacct-summary.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/pmacct-collector --input-dir /var/lib/ntop-tools/pmacct
+ExecStart=/usr/local/bin/pmacct-collector --input-dir /var/lib/ntop-tools/pmacct --db /var/lib/ntop-tools/traffic.db --allow-production
