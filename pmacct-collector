@@ -159,6 +159,7 @@ def main():
     p.add_argument("--min-age", type=int, default=120, help="Minimum file age in seconds")
     p.add_argument("--accounting", action="store_true", help="Show attribution statistics")
     p.add_argument("--allow-production", action="store_true", help="Allow production DB after migration")
+    p.add_argument("--retain-hours", type=int, default=48, help="Prune verified imported JSON older than N hours (0 disables)")
     args = p.parse_args()
     cfg = read_config(args.config)
     network_text = args.local_networks or cfg.get("PMACCT_LOCAL_NETWORKS", "")
@@ -186,6 +187,21 @@ def main():
                 print(f"{path.name}: rows={count} bytes={size} skipped={skipped}")
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"SKIP {path.name}: {exc}", flush=True)
+    if args.retain_hours > 0:
+        cutoff = time.time() - args.retain_hours * 3600
+        removed = 0
+        for path in Path(args.input_dir).glob(args.prefix + "*.json"):
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+                row = con.execute("SELECT sha256 FROM pmacct_imports WHERE filename=?", (path.name,)).fetchone()
+                if row and hashlib.sha256(path.read_bytes()).hexdigest() == row[0]:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            print(f"Removed {removed} verified imported JSON files older than {args.retain_hours}h")
     con.close()
 
 if __name__ == "__main__":
