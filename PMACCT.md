@@ -95,3 +95,27 @@ The historical SQLite path remains `/var/lib/ntop-tools/traffic.db`, so `ntop-su
 **Known compatibility differences:** pmacct packet aggregation does not provide ntopng L7 application classification or new-flow counts. For pmacct-era records, `l7` is empty and `new_flows` is zero. `ntop-summary interface` and `ntop-summary live` still depend on the ntopng REST API and are unavailable when ntopng is stopped; historical queries continue to work. These commands need backend-specific implementations if required. The current time-bucket assignment uses print output end timestamps and is not a packet-level timestamp.
 
 **Rollback:** disable `pmacct-import.timer`, re-enable `ntopng.service` and `ntop-collector.timer`, and restore the backup only after stopping writers and explicitly deciding whether to discard pmacct-era writes. Do not copy a SQLite backup over an actively open WAL database.
+
+## Reusable migration and traffic-summary scripts
+
+Three helper commands are included:
+
+```bash
+# Read-only migration audit; compares cumulative bytes and records
+./pmacct-migration.sh check
+
+# Daily / IP / port reports from the unified historical database
+./pmacct-migration.sh report
+DAYS=7 BY=ip ./pmacct-migration.sh report
+python3 pmacct-traffic-report --days 30 --by ip-port --limit 50
+
+# Explicit one-time migration on a machine NOT yet migrated
+sudo PMACCT_MIGRATION_CONFIRM=YES ./pmacct-migration.sh execute
+
+# Rebuild historical daily aggregate tables after a successful migration
+sudo ./pmacct-migration.sh rollup
+```
+
+`execute` stops the two writer timers and calls the backed-up atomic migration, but intentionally does **not** automatically switch production services. Verify the merged database and deploy the correct pmacct importer unit before disabling ntopng. If `pmacct_cutover_bucket` already exists, it refuses to migrate again. This is important on local-57, which is already migrated: use only `check` and `report` there.
+
+The report groups the underlying `traffic` minute table (not `traffic_daily`) for consistent semantics. Large historical databases may take longer for a 30-day report; existing `ntop-summary 30d` remains the optimized query path.
