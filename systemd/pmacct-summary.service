@@ -1,7 +1,6 @@
 [Unit]
 Description=pmacct lightweight traffic accounting for ntop-summary
 After=network.target
-ConditionPathExists=/sys/class/net/tun2socks
 
 [Service]
 Type=simple
