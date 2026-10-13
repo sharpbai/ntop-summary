@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Import pmacct print-plugin JSONL files into a separate ntop-summary SQLite database.
+
+Safe for repeated runs: each input file is imported transactionally exactly once.
+This experimental backend deliberately uses a separate database by default.
+"""
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+def read_config(path):
+    cfg = {}
+    if Path(path).exists():
+        for line in Path(path).read_text().splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    return cfg
+
+def normalize(record, local_networks):
+    try:
+        src = str(ipaddress.ip_address(record["ip_src"]))
+        dst = str(ipaddress.ip_address(record["ip_dst"]))
+        sp = int(record.get("port_src") or 0)
+        dp = int(record.get("port_dst") or 0)
+        size = int(record["bytes"])
+        proto = str(record.get("ip_proto", "")).upper()
+    except (KeyError, ValueError, TypeError):
+        return None
+    if size < 0 or not 0 <= sp <= 65535 or not 0 <= dp <= 65535:
+        return None
+    src_local = any(ipaddress.ip_address(src) in n for n in local_networks)
+    dst_local = any(ipaddress.ip_address(dst) in n for n in local_networks)
+    if src_local and not dst_local:
+        return src, dst, dp, proto, size
+    if dst_local and not src_local:
+        return dst, src, sp, proto, size
+    # Ambiguous: two local endpoints or two remote endpoints. Never invent a client.
+    return None
+
+def init_db(con):
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS traffic (
+      bucket INTEGER NOT NULL, src_ip TEXT NOT NULL, dst_ip TEXT NOT NULL,
+      dst_port INTEGER NOT NULL, l4 TEXT NOT NULL DEFAULT '',
+      l7 TEXT NOT NULL DEFAULT '', bytes INTEGER NOT NULL DEFAULT 0,
+      new_flows INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(bucket,src_ip,dst_ip,dst_port,l4,l7)
+    );
+    CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic(bucket);
+    CREATE TABLE IF NOT EXISTS pmacct_imports (
+      filename TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+      imported_at INTEGER NOT NULL, records INTEGER NOT NULL,
+      bytes INTEGER NOT NULL, skipped INTEGER NOT NULL
+    );
+    """)
+
+def import_file(con, path, nets):
+    # Timestamp is the *end* of the completed print interval.
+    # File naming: YYYYmmdd-HHMMSS; configured refresh interval is used
+    # to place the accounting in the preceding minute bucket.
+    import datetime
+    stamp = path.stem.rsplit("-", 2)
+    if len(stamp) < 3:
+        raise ValueError("Expected file name prefix-YYYYmmdd-HHMMSS.json")
+    try:
+        ended = int(datetime.datetime.strptime(stamp[-2] + "-" + stamp[-1],
+                                               "%Y%m%d-%H%M%S").timestamp())
+    except ValueError as exc:
+        raise ValueError("Invalid print output timestamp") from exc
+    bucket = (ended - 1) // 60 * 60
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    rows = 0
+    skipped = 0
+    total = 0
+    aggregates = {}
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        value = normalize(item, nets)
+        if value is None:
+            skipped += 1
+            continue
+        src, dst, port, proto, size = value
+        key = (bucket, src, dst, port, proto, "")
+        aggregates[key] = aggregates.get(key, 0) + size
+        rows += 1
+        total += size
+    with con:
+        existing = con.execute("SELECT sha256 FROM pmacct_imports WHERE filename=?",
+                               (path.name,)).fetchone()
+        if existing:
+            if existing[0] != digest:
+                raise ValueError(f"Already imported file changed: {path.name}")
+            return False, 0, 0, 0
+        con.executemany("""
+          INSERT INTO traffic(bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows)
+          VALUES(?,?,?,?,?,?,?,0)
+          ON CONFLICT(bucket,src_ip,dst_ip,dst_port,l4,l7)
+          DO UPDATE SET bytes=bytes+excluded.bytes
+        """, [(*k, value) for k, value in aggregates.items()])
+        con.execute("""INSERT INTO pmacct_imports
+          (filename,sha256,imported_at,records,bytes,skipped)
+          VALUES(?,?,?,?,?,?)""",
+          (path.name, digest, int(time.time()), rows, total, skipped))
+    return True, rows, total, skipped
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", default="/etc/ntop-tools.conf")
+    p.add_argument("--input-dir", required=True)
+    p.add_argument("--db", default="/var/lib/ntop-tools/pmacct-staging.db")
+    p.add_argument("--local-networks", help="Comma-separated client networks")
+    p.add_argument("--prefix", default="pmacct-")
+    args = p.parse_args()
+    cfg = read_config(args.config)
+    network_text = args.local_networks or cfg.get("PMACCT_LOCAL_NETWORKS", "")
+    if not network_text:
+        p.error("Specify --local-networks or PMACCT_LOCAL_NETWORKS; cannot infer client direction")
+    nets = [ipaddress.ip_network(s.strip(), strict=False)
+            for s in network_text.split(",") if s.strip()]
+    if Path(args.db).resolve() == Path(cfg.get("NTOP_DB",
+             "/var/lib/ntop-tools/traffic.db")).resolve():
+        p.error("Refusing to write to the production ntopng database")
+    Path(args.db).parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(args.db, timeout=30)
+    init_db(con)
+    for path in sorted(Path(args.input_dir).glob(args.prefix + "*.json")):
+        try:
+            changed, count, size, skipped = import_file(con, path, nets)
+            if changed:
+                print(f"{path.name}: rows={count} bytes={size} skipped={skipped}")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"SKIP {path.name}: {exc}", flush=True)
+    con.close()
+
+if __name__ == "__main__":
+    main()
