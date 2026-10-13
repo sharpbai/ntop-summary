@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""One-time, backed-up migration from ntopng minute data to pmacct minute data.
+
+Run only after stopping both collector timers. pmacct capture itself remains running.
+"""
+import argparse
+import datetime
+import os
+import shutil
+import sqlite3
+import time
+from pathlib import Path
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--production", default="/var/lib/ntop-tools/traffic.db")
+    p.add_argument("--staging", default="/var/lib/ntop-tools/pmacct-staging.db")
+    p.add_argument("--cutoff", type=int, help="Unix timestamp, aligned to minute")
+    args = p.parse_args()
+    prod, stage = Path(args.production), Path(args.staging)
+    if not prod.exists() or not stage.exists() or prod.resolve() == stage.resolve():
+        p.error("Both distinct production and staging databases must exist")
+    cutoff = args.cutoff or ((int(time.time()) - 180) // 60 * 60)
+    if cutoff % 60:
+        p.error("cutoff must be minute-aligned")
+    backup = prod.with_name(prod.name + ".pre-pmacct-" +
+                            datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + ".bak")
+    src = sqlite3.connect(str(prod), timeout=60)
+    dst = sqlite3.connect(str(backup), timeout=60)
+    src.backup(dst)
+    dst.close()
+    print(f"BACKUP={backup}", flush=True)
+    con = sqlite3.connect(str(prod), timeout=60, isolation_level=None)
+    con.execute("PRAGMA busy_timeout=60000")
+    con.execute("ATTACH DATABASE ? AS stage", (str(stage),))
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.execute("""CREATE TABLE IF NOT EXISTS pmacct_imports (
+            filename TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
+            imported_at INTEGER NOT NULL, records INTEGER NOT NULL,
+            bytes INTEGER NOT NULL, skipped INTEGER NOT NULL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS pmacct_accounting (
+            filename TEXT NOT NULL, category TEXT NOT NULL,
+            records INTEGER NOT NULL, bytes INTEGER NOT NULL,
+            PRIMARY KEY(filename,category))""")
+        old = con.execute("SELECT COALESCE(SUM(bytes),0) FROM traffic WHERE bucket>=?",
+                          (cutoff,)).fetchone()[0]
+        new = con.execute("SELECT COALESCE(SUM(bytes),0) FROM stage.traffic WHERE bucket>=?",
+                          (cutoff,)).fetchone()[0]
+        if new <= 0:
+            raise RuntimeError("No pmacct data in selected cutover window")
+        con.execute("DELETE FROM traffic WHERE bucket>=?", (cutoff,))
+        con.execute("""INSERT INTO traffic
+            (bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows)
+            SELECT bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows
+            FROM stage.traffic WHERE bucket>=?""", (cutoff,))
+        con.execute("""INSERT OR IGNORE INTO pmacct_imports
+            SELECT filename,sha256,imported_at,records,bytes,skipped FROM stage.pmacct_imports""")
+        con.execute("""INSERT OR IGNORE INTO pmacct_accounting
+            SELECT filename,category,records,bytes FROM stage.pmacct_accounting""")
+        con.execute("""INSERT OR REPLACE INTO metadata(key,value)
+            VALUES('pmacct_cutover_bucket',?)""", (str(cutoff),))
+        con.execute("COMMIT")
+        print(f"CUTOVER={cutoff} old_bytes_replaced={old} pmacct_bytes_inserted={new}", flush=True)
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+        src.close()
+
+if __name__ == "__main__":
+    main()
