@@ -44,10 +44,10 @@ def normalize(record, local_networks, excluded, servers=None, ports=None):
         return None
     if size < 0 or not 0 <= sp <= 65535 or not 0 <= dp <= 65535:
         return None
-    if servers and ports:
-        if dst in servers and dp in ports and src not in servers:
+    if servers:
+        if dst in servers and (not ports or dp in ports) and src not in servers:
             return 'attributed', (src, dst, dp, proto, size), size
-        if src in servers and sp in ports and dst not in servers:
+        if src in servers and (not ports or sp in ports) and dst not in servers:
             return 'attributed', (dst, src, sp, proto, size), size
         return 'unclassified', None, size
     a = classify(src, local_networks, excluded)
@@ -177,8 +177,8 @@ def main():
     excluded = [ipaddress.ip_network(x.strip(), strict=False) for x in excluded_text.split(",") if x.strip()]
     servers_text = args.server_addresses or cfg.get("PMACCT_SERVER_ADDRESSES", "")
     ports_text = args.service_ports or cfg.get("PMACCT_SERVICE_PORTS", "")
-    if bool(servers_text) != bool(ports_text):
-        p.error("Ingress mode requires both server addresses and service ports")
+    if ports_text and not servers_text:
+        p.error("Service port filter requires server addresses")
     servers = {str(ipaddress.ip_address(x.strip())) for x in servers_text.split(",") if x.strip()}
     ports = {int(x.strip()) for x in ports_text.split(",") if x.strip()}
     if any(port < 1 or port > 65535 for port in ports): p.error("Invalid service port")
