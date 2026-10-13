@@ -51,7 +51,7 @@ def main():
             current = again
             if now - last_restart >= args.cooldown:
                 print(f"ifindex changed: {previous} -> {current}; restarting {args.service}", flush=True)
-                subprocess.run(["systemctl", "try-restart", args.service], check=False, timeout=30)
+                subprocess.run(["systemctl", "restart", args.service], check=False, timeout=30)
                 last_restart = time.monotonic()
                 last_progress = last_restart
         elif previous_bytes is not None and current[2] > previous_bytes:
@@ -59,7 +59,7 @@ def main():
             if newest and time.time() - newest > args.stale_seconds and now - last_progress > args.stale_seconds:
                 if now - last_restart >= args.cooldown:
                     print("Interface traffic rising but JSON output stale; restarting capture", flush=True)
-                    subprocess.run(["systemctl", "try-restart", args.service], check=False, timeout=30)
+                    subprocess.run(["systemctl", "restart", args.service], check=False, timeout=30)
                     last_restart = time.monotonic()
                     last_progress = last_restart
             elif newest and time.time() - newest <= args.stale_seconds:
