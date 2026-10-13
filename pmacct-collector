@@ -158,6 +158,7 @@ def main():
     p.add_argument("--exclude-networks", help="Comma-separated excluded CIDRs")
     p.add_argument("--min-age", type=int, default=120, help="Minimum file age in seconds")
     p.add_argument("--accounting", action="store_true", help="Show attribution statistics")
+    p.add_argument("--allow-production", action="store_true", help="Allow production DB after migration")
     args = p.parse_args()
     cfg = read_config(args.config)
     network_text = args.local_networks or cfg.get("PMACCT_LOCAL_NETWORKS", "")
@@ -165,7 +166,7 @@ def main():
             for s in network_text.split(",") if s.strip()]
     excluded_text = args.exclude_networks or cfg.get("PMACCT_EXCLUDE_NETWORKS", "")
     excluded = [ipaddress.ip_network(x.strip(), strict=False) for x in excluded_text.split(",") if x.strip()]
-    if Path(args.db).resolve() == Path(cfg.get("NTOP_DB",
+    if not args.allow_production and Path(args.db).resolve() == Path(cfg.get("NTOP_DB",
              "/var/lib/ntop-tools/traffic.db")).resolve():
         p.error("Refusing to write to the production ntopng database")
     Path(args.db).parent.mkdir(parents=True, exist_ok=True)
