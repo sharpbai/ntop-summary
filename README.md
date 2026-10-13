@@ -319,3 +319,12 @@ The installer writes a dedicated ntopng drop-in selecting only that interface.
 ## License
 
 MIT
+
+## pmacct backend: interface and live commands
+
+After production migration (database metadata contains `pmacct_cutover_bucket`), `ntop-summary` automatically uses the pmacct implementation for these commands, without contacting the ntopng REST API:
+
+- `ntop-summary interface`: Linux sysfs RX/TX bytes and packets **since the current interface was created**, plus a 1-second throughput sample. The counters reset if the TUN interface is recreated.
+- `ntop-summary live --limit 10`: latest **imported completed minute** from SQLite, with existing `--by`, `--ip`, `--port`, and `--limit` filters. This is **not** a list of currently active TCP/UDP connections. New-flow counts are unavailable (displayed as zero); `--l7` is unsupported.
+
+For ntopng-only installations, the original API-based `interface` and `live` behavior remains unchanged. Historical commands continue to use SQLite in both modes.
