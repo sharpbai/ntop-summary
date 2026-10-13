@@ -1,0 +1,10 @@
+[Unit]
+Description=Import pmacct traffic JSON every minute
+
+[Timer]
+OnCalendar=*:0/1
+Persistent=true
+Unit=pmacct-import.service
+
+[Install]
+WantedBy=timers.target
