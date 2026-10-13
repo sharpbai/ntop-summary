@@ -72,9 +72,23 @@ def init_db(con):
       new_flows INTEGER NOT NULL DEFAULT 0,
       upload_bytes INTEGER NOT NULL DEFAULT 0,
       download_bytes INTEGER NOT NULL DEFAULT 0,
+      upload_packets INTEGER NOT NULL DEFAULT 0,
+      download_packets INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(bucket,src_ip,dst_ip,dst_port,l4,l7)
     );
     CREATE INDEX IF NOT EXISTS idx_traffic_bucket ON traffic(bucket);
+    CREATE TABLE IF NOT EXISTS traffic_connections (
+      bucket INTEGER NOT NULL, src_ip TEXT NOT NULL, dst_ip TEXT NOT NULL,
+      dst_port INTEGER NOT NULL, client_port INTEGER NOT NULL,
+      bytes INTEGER NOT NULL DEFAULT 0,
+      upload_bytes INTEGER NOT NULL DEFAULT 0,
+      download_bytes INTEGER NOT NULL DEFAULT 0,
+      upload_packets INTEGER NOT NULL DEFAULT 0,
+      download_packets INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(bucket,src_ip,dst_ip,dst_port,client_port)
+    );
+    CREATE INDEX IF NOT EXISTS idx_connections_src_bucket
+      ON traffic_connections(src_ip,bucket);
     CREATE TABLE IF NOT EXISTS pmacct_imports (
       filename TEXT PRIMARY KEY, sha256 TEXT NOT NULL,
       imported_at INTEGER NOT NULL, records INTEGER NOT NULL,
@@ -89,11 +103,11 @@ def init_db(con):
     # Existing production databases retain historical total bytes. The direction
     # columns are zero for legacy rows: zero means unknown, NOT zero traffic.
     columns = {row[1] for row in con.execute("PRAGMA table_info(traffic)")}
-    for column in ("upload_bytes", "download_bytes"):
+    for column in ("upload_bytes", "download_bytes", "upload_packets", "download_packets"):
         if column not in columns:
             con.execute(f"ALTER TABLE traffic ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
 
-def import_file(con, path, nets, excluded, min_age, servers=None, ports=None):
+def import_file(con, path, nets, excluded, min_age, servers=None, ports=None, detail_days=7):
     if time.time() - path.stat().st_mtime < min_age:
         return False, 0, 0, 0
     # Timestamp is the *end* of the completed print interval.
@@ -121,6 +135,7 @@ def import_file(con, path, nets, excluded, min_age, servers=None, ports=None):
     skipped = 0
     total = 0
     aggregates = {}
+    details = {}
     accounting = {key: [0, 0] for key in ("attributed", "ambiguous", "unclassified", "excluded", "invalid")}
     for line in raw.splitlines():
         if not line.strip():
@@ -142,15 +157,32 @@ def import_file(con, path, nets, excluded, min_age, servers=None, ports=None):
             skipped += 1
             continue
         src, dst, port, proto, size = payload
-        key = (bucket, src, dst, port, proto, "")
+        key = (bucket, src, dst, port, "", "")
+        try:
+            packets = int(item.get("packets", 0))
+            if packets < 0: raise ValueError("negative packets")
+            client_port = int(item["port_src"] if item["ip_src"] == src else item["port_dst"])
+            if not 0 <= client_port <= 65535: raise ValueError("invalid client port")
+        except (ValueError, TypeError, KeyError):
+            raise ValueError(f"Invalid packet count or client port in {path.name}")
         # Packet direction relative to the attributed client, not the interface.
         # Client -> server = upload; server -> client = download.
-        up, down = aggregates.get(key, (0, 0))
-        if str(ipaddress.ip_address(item["ip_src"])) == src:
+        up, down, up_pk, down_pk = aggregates.get(key, (0, 0, 0, 0))
+        direction_up = str(ipaddress.ip_address(item["ip_src"])) == src
+        if direction_up:
             up += size
+            up_pk += packets
         else:
             down += size
-        aggregates[key] = (up, down)
+            down_pk += packets
+        aggregates[key] = (up, down, up_pk, down_pk)
+        if detail_days > 0 and bucket >= int(time.time()) - detail_days * 86400:
+            detail_key = (bucket, src, dst, port, client_port)
+            du, dd, pu, pd = details.get(detail_key, (0, 0, 0, 0))
+            details[detail_key] = (du + (size if direction_up else 0),
+                                   dd + (0 if direction_up else size),
+                                   pu + (packets if direction_up else 0),
+                                   pd + (0 if direction_up else packets))
         rows += 1
         total += size
     with con:
@@ -161,13 +193,27 @@ def import_file(con, path, nets, excluded, min_age, servers=None, ports=None):
                 raise ValueError(f"Already imported file changed: {path.name}")
             return False, 0, 0, 0
         con.executemany("""
-          INSERT INTO traffic(bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows,upload_bytes,download_bytes)
-          VALUES(?,?,?,?,?,?,?,0,?,?)
+          INSERT INTO traffic(bucket,src_ip,dst_ip,dst_port,l4,l7,bytes,new_flows,
+                              upload_bytes,download_bytes,upload_packets,download_packets)
+          VALUES(?,?,?,?,?,?,?,0,?,?,?,?)
           ON CONFLICT(bucket,src_ip,dst_ip,dst_port,l4,l7)
           DO UPDATE SET bytes=bytes+excluded.bytes,
             upload_bytes=upload_bytes+excluded.upload_bytes,
-            download_bytes=download_bytes+excluded.download_bytes
-        """, [(*k, up+down, up, down) for k, (up, down) in aggregates.items()])
+            download_bytes=download_bytes+excluded.download_bytes,
+            upload_packets=upload_packets+excluded.upload_packets,
+            download_packets=download_packets+excluded.download_packets
+        """, [(*k, up+down, up, down, pu, pd) for k, (up, down, pu, pd) in aggregates.items()])
+        con.executemany("""
+          INSERT INTO traffic_connections(bucket,src_ip,dst_ip,dst_port,client_port,
+             bytes,upload_bytes,download_bytes,upload_packets,download_packets)
+          VALUES(?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(bucket,src_ip,dst_ip,dst_port,client_port)
+          DO UPDATE SET bytes=bytes+excluded.bytes,
+             upload_bytes=upload_bytes+excluded.upload_bytes,
+             download_bytes=download_bytes+excluded.download_bytes,
+             upload_packets=upload_packets+excluded.upload_packets,
+             download_packets=download_packets+excluded.download_packets
+        """, [(*k, up+down, up, down, pu, pd) for k,(up,down,pu,pd) in details.items()])
         con.executemany("""INSERT INTO pmacct_accounting
           (filename,category,records,bytes) VALUES(?,?,?,?)""",
           [(path.name, category, values[0], values[1]) for category, values in accounting.items()])
@@ -190,8 +236,10 @@ def main():
     p.add_argument("--min-age", type=int, default=120, help="Minimum file age in seconds")
     p.add_argument("--accounting", action="store_true", help="Show attribution statistics")
     p.add_argument("--allow-production", action="store_true", help="Allow production DB after migration")
+    p.add_argument("--detail-days", type=int, default=7, help="Connection detail retention in days; 0 disables")
     p.add_argument("--retain-hours", type=int, default=48, help="Prune verified imported JSON older than N hours (0 disables)")
     args = p.parse_args()
+    if args.detail_days < 0: p.error("--detail-days must be nonnegative")
     cfg = read_config(args.config)
     network_text = args.local_networks or cfg.get("PMACCT_LOCAL_NETWORKS", "")
     nets = [ipaddress.ip_network(s.strip(), strict=False)
@@ -220,11 +268,15 @@ def main():
         return
     for path in sorted(Path(args.input_dir).glob(args.prefix + "*.json")):
         try:
-            changed, count, size, skipped = import_file(con, path, nets, excluded, args.min_age, servers, ports)
+            changed, count, size, skipped = import_file(con, path, nets, excluded, args.min_age, servers, ports, args.detail_days)
             if changed:
                 print(f"{path.name}: rows={count} bytes={size} skipped={skipped}")
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"SKIP {path.name}: {exc}", flush=True)
+    if args.detail_days > 0:
+        cutoff_bucket = (int(time.time()) - args.detail_days * 86400) // 60 * 60
+        with con:
+            con.execute("DELETE FROM traffic_connections WHERE bucket < ?", (cutoff_bucket,))
     if args.retain_hours > 0:
         cutoff = time.time() - args.retain_hours * 3600
         removed = 0
