@@ -38,3 +38,44 @@ For historical reporting, the staging database can be passed to existing CLI too
 - Add robust file finalization / atomic rename or a completed-file marker: never import a file still being written.
 - Implement a supervised pmacct service with TUN recreation recovery, storage retention, and health monitoring.
 - Provide a migration and rollback plan; keep old data intact.
+
+
+## Parallel systemd deployment (Debian 12 / local-57)
+
+The following units are available:
+
+- `pmacct-summary.service`: packet capture, `tun2socks` (configured in ExecStart)
+- `pmacct-interface-watch.service`: checks Linux ifindex every 5 seconds, restarts capture on recreation; also checks output freshness when traffic is rising
+- `pmacct-import.timer` and `pmacct-import.service`: import JSONL once per minute
+
+Install:
+
+```bash
+sudo install -m 0755 pmacct-collector pmacct-interface-watch /usr/local/bin/
+sudo install -m 0644 pmacctd.example.conf /etc/pmacct/ntop-summary.conf
+sudo install -m 0644 systemd/pmacct-*.service systemd/pmacct-import.timer /etc/systemd/system/
+sudo install -d -m 0700 /var/lib/ntop-tools/pmacct
+sudo systemctl daemon-reload
+sudo systemctl enable --now pmacct-summary.service pmacct-interface-watch.service pmacct-import.timer
+```
+
+Add to `/etc/ntop-tools.conf` (illustrative local-57 values; confirm network ownership):
+
+```ini
+PMACCT_LOCAL_NETWORKS=192.168.0.0/16,10.8.24.0/24
+PMACCT_EXCLUDE_NETWORKS=10.0.0.0/30
+```
+
+`pmacct-collector` now categorizes `attributed`, `ambiguous`, `unclassified`, `excluded`, and `invalid` traffic, and tracks both records and bytes in `pmacct_accounting`. RFC1918/ULA endpoints are *candidates*, not proof of client ownership. When both endpoints are private, attribution is ambiguous and remains unassigned.
+
+By default, JSON files modified in the last 120 seconds are ignored to avoid reading an in-progress file. Use:
+
+```bash
+sudo pmacct-collector --input-dir /var/lib/ntop-tools/pmacct --accounting
+sudo systemctl status pmacct-summary pmacct-interface-watch pmacct-import.timer
+sudo journalctl -u pmacct-import.service -n 30 --no-pager
+```
+
+The old ntopng timer remains enabled during this phase. Never write pmacct data into `traffic.db` until migration and reporting compatibility have been verified. Do not delete JSON files unless their import has been confirmed.
+
+**Important limitations:** The watcher uses periodic sysfs checks rather than an event-driven netlink socket. It catches recreated ifindex changes and disappearance/reappearance, but very fast changes between checks can be missed. The health check also depends on regular output and traffic movement. The current importer assigns a 60-second output interval to the minute preceding the file timestamp; it does not yet split non-aligned intervals across minute boundaries. Historical totals are usable for validation, but exact per-minute boundaries need improvement before production cutover.
