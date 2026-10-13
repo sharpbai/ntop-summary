@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Read-only migration audit and traffic totals for ntop-summary databases."""
+import argparse
+import datetime as dt
+import sqlite3
+from pathlib import Path
+
+def connect(path):
+    if not Path(path).is_file():
+        raise ValueError("Database not found: " + path)
+    return sqlite3.connect("file:" + str(Path(path).resolve()) + "?mode=ro", uri=True)
+
+def totals(con, start=None, end=None):
+    where = []
+    args = []
+    if start is not None:
+        where.append("bucket>=?")
+        args.append(start)
+    if end is not None:
+        where.append("bucket<?")
+        args.append(end)
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    return con.execute("SELECT COUNT(*),COALESCE(SUM(bytes),0),MIN(bucket),MAX(bucket) FROM traffic" + clause,args).fetchone()
+
+def human(n):
+    return f"{n/1024**3:.3f} GiB"
+
+def fmt(ts):
+    return dt.datetime.fromtimestamp(ts).isoformat(sep=" ",timespec="seconds") if ts is not None else "-"
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--production", default="/var/lib/ntop-tools/traffic.db")
+    p.add_argument("--staging", default="/var/lib/ntop-tools/pmacct-staging.db")
+    p.add_argument("--cutoff", type=int, help="Minute-aligned Unix timestamp")
+    p.add_argument("--compare-minutes", type=int, default=20)
+    args = p.parse_args()
+    with connect(args.production) as prod, connect(args.staging) as stage:
+        meta = dict(prod.execute("SELECT key,value FROM metadata")) if prod.execute("SELECT 1 FROM sqlite_master WHERE name='metadata'").fetchone() else {}
+        cutoff = args.cutoff or int(meta.get("pmacct_cutover_bucket", 0)) or None
+        print("Production:", args.production)
+        print("Staging   :", args.staging)
+        print("Cutover   :", fmt(cutoff))
+        for name, con in (("production",prod),("staging",stage)):
+            rows, size, first, last = totals(con)
+            print(f"{name:10s}: {rows:,} rows, {size:,} bytes ({human(size)}), {fmt(first)} -> {fmt(last)}")
+        pmax = totals(prod)[3]
+        smax = totals(stage)[3]
+        if pmax is not None and smax is not None:
+            end = min(pmax,smax)+60
+            start = end - args.compare_minutes*60
+            if cutoff is not None:
+                start = max(start,cutoff)
+            if start < end:
+                a = totals(prod,start,end)[1]
+                b = totals(stage,start,end)[1]
+                diff = abs(a-b)/b*100 if b else None
+                print(f"Common window: {fmt(start)} -> {fmt(end)}")
+                print(f"Production   : {a:,} bytes")
+                print(f"Staging      : {b:,} bytes")
+                print(f"Difference   : {diff:.3f}% of staging" if diff is not None else "Difference   : N/A")
+                print("NOTE: after migration these may be identical by construction; not an independent capture accuracy test.")
+        if prod.execute("SELECT 1 FROM sqlite_master WHERE name='pmacct_accounting'").fetchone():
+            print("Attribution by category:")
+            for cat, count, size in prod.execute("SELECT category,SUM(records),SUM(bytes) FROM pmacct_accounting GROUP BY category ORDER BY category"):
+                print(f"  {cat:14s} {count:>10,} records {size:>15,} bytes")
+        print("Audit complete (read-only).")
+
+if __name__ == "__main__":
+    main()
