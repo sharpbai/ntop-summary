@@ -1,0 +1,7 @@
+[Unit]
+Description=Import completed pmacct accounting files
+After=pmacct-summary.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pmacct-collector --input-dir /var/lib/ntop-tools/pmacct
